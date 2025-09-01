@@ -12,7 +12,7 @@ def find_low_res_images(start_path, output_file):
     """
     # Define the target image filenames and the minimum resolution
     target_filenames = {"folder.jpg", "cover.jpg", "front.jpg"}
-    min_resolution = (800, 800)
+    min_resolution = (400, 400)
 
     # Get the absolute path for the output file
     output_path = os.path.abspath(output_file)
