@@ -92,7 +92,7 @@ def lookup_year_mb(artist: str, album: str) -> Optional[tuple]:
     result_url = None
     for rg in rgs:
         d = rg.get("first-release-date")
-        if d:
+        if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
             m = re.match(r"^(\d{4})", d)
             if m:
                 years.append(int(m.group(1)))
@@ -109,11 +109,22 @@ def lookup_year_mb(artist: str, album: str) -> Optional[tuple]:
     for rel in rels:
         if not result_url:
             result_url = f"https://musicbrainz.org/release/{rel.get("id")}" if rel.get("id") else None
-        d = rel.get("date")
-        if d:
-            m = re.match(r"^(\d{4})", d)
-            if m:
-                years.append(int(m.group(1)))
+        # prefer release-events which have structured dates
+        events = rel.get("release-event-list", [])
+        for event in events:
+            d = event.get("date")
+            if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
+                m = re.match(r"^(\d{4})", d)
+                if m:
+                    years.append(int(m.group(1)))
+                    break  # take first valid event date
+        # fallback to top-level date if no events found
+        if not events:
+            d = rel.get("date")
+            if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
+                m = re.match(r"^(\d{4})", d)
+                if m:
+                    years.append(int(m.group(1)))
     if years:
         return (str(min(years)), result_url)
     return None
