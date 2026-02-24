@@ -50,7 +50,7 @@ def find_problem_albums(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     return cur.fetchall()
 
 
-def lookup_year_discogs(artist: str, album: str, token: Optional[str], user_agent: str) -> Optional[str]:
+def lookup_year_discogs(artist: str, album: str, token: Optional[str], user_agent: str) -> Optional[tuple]:
     if not artist and not album:
         return None
     url = "https://api.discogs.com/database/search"
@@ -70,30 +70,36 @@ def lookup_year_discogs(artist: str, album: str, token: Optional[str], user_agen
     data = r.json()
     results = data.get("results", [])
     years = []
+    result_url = None
     for res in results:
         y = res.get("year")
         if isinstance(y, int) and 1000 <= y <= 9999:
             years.append(y)
+            if not result_url:
+                result_url = res.get("uri")
     if years:
-        return str(min(years))
+        return (str(min(years)), result_url)
     return None
 
 
-def lookup_year_mb(artist: str, album: str) -> Optional[str]:
+def lookup_year_mb(artist: str, album: str) -> Optional[tuple]:
     try:
         res = musicbrainzngs.search_release_groups(artist=artist or "", releasegroup=album or "", limit=5)
     except Exception:
         return None
     rgs = res.get("release-group-list", [])
     years = []
+    result_url = None
     for rg in rgs:
         d = rg.get("first-release-date")
         if d:
             m = re.match(r"^(\d{4})", d)
             if m:
                 years.append(int(m.group(1)))
+                if not result_url:
+                    result_url = f"https://musicbrainz.org/release-group/{rg.get("id")}"
     if years:
-        return str(min(years))
+        return (str(min(years)), result_url)
 
     try:
         r = musicbrainzngs.search_releases(artist=artist or "", release=album or "", limit=5)
@@ -101,13 +107,15 @@ def lookup_year_mb(artist: str, album: str) -> Optional[str]:
         return None
     rels = r.get("release-list", [])
     for rel in rels:
+        if not result_url:
+            result_url = f"https://musicbrainz.org/release/{rel.get("id")}" if rel.get("id") else None
         d = rel.get("date")
         if d:
             m = re.match(r"^(\d{4})", d)
             if m:
                 years.append(int(m.group(1)))
     if years:
-        return str(min(years))
+        return (str(min(years)), result_url)
     return None
 
 
@@ -275,17 +283,24 @@ def main(argv=None):
         print('Artist:', artist)
         print('Current date field:', repr(cur_date))
         year = None
+        source_url = None
         # Try Discogs first
         try:
-            year = lookup_year_discogs(artist, name, args.discogs_token, args.user_agent)
+            result = lookup_year_discogs(artist, name, args.discogs_token, args.user_agent)
+            if result:
+                year, source_url = result
         except Exception:
             year = None
         if not year:
-            year = lookup_year_mb(artist, name)
+            result = lookup_year_mb(artist, name)
+            if result:
+                year, source_url = result
         if not year:
             print('Could not find a reliable year via Discogs/MusicBrainz.')
             continue
         print('Discovered year:', year)
+        if source_url:
+            print('Source URL:', source_url)
         mp3s = find_mp3_files(conn, album_id, args.media_root)
         print('MP3 files found for album:', len(mp3s))
 
