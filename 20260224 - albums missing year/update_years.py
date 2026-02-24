@@ -42,18 +42,31 @@ except ImportError:
 YEAR_RE = re.compile(r"^(\d{4})$")
 
 
-def find_problem_albums(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+def find_problem_albums(conn: sqlite3.Connection, with_plays_or_ratings: bool = False) -> List[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     # date empty or not a 4-digit year
-    cur.execute(
-        """
+    base_query = """
         SELECT id, name, album_artist, date
         FROM album
         WHERE date IS NULL OR date = '' OR date NOT GLOB '[0-9][0-9][0-9][0-9]'
+    """
+    if with_plays_or_ratings:
+        # Inner join with annotation to ensure tracks have plays or ratings
+        query = f"""
+        {base_query}
+        AND id IN (
+            SELECT DISTINCT album_id FROM media_file mf
+            WHERE album_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM annotation
+                WHERE item_id = mf.id AND item_type = 'track' AND (play_count > 0 OR rating > 0)
+            )
+        )
         ORDER BY name
         """
-    )
+    else:
+        query = base_query + "ORDER BY name"
+    cur.execute(query)
     return cur.fetchall()
 
 
@@ -257,6 +270,7 @@ def main(argv=None):
     parser.add_argument('--state-file', help='JSON file to track processed albums', default='update_years_state.json')
     parser.add_argument('--force', help='Reprocess albums even if present in state file', action='store_true')
     parser.add_argument('--similarity-threshold', help='Minimum Levenshtein similarity (0-1) for artist/album match', type=float, default=0.7)
+    parser.add_argument('--with-plays-or-ratings', help='Only process albums with tracks that have plays or ratings', action='store_true')
     parser.add_argument('--dry-run', help="Don't write tags; just print what would be done", action='store_true')
     args = parser.parse_args(argv)
 
@@ -302,7 +316,7 @@ def main(argv=None):
 
     state = load_state(args.state_file)
 
-    albums = find_problem_albums(conn)
+    albums = find_problem_albums(conn, args.with_plays_or_ratings)
     if not albums:
         print('No albums with missing/non-YYYY dates found.')
         return
