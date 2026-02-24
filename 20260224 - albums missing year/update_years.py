@@ -5,6 +5,7 @@
 #     "mutagen",
 #     "musicbrainzngs",
 #     "requests",
+#     "python-Levenshtein",
 # ]
 # ///
 
@@ -22,7 +23,7 @@ import os
 import re
 import sqlite3
 import sys
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import requests
 import musicbrainzngs
@@ -30,6 +31,12 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TDRC, ID3NoHeaderError
 import json
 from datetime import datetime
+try:
+    from Levenshtein import ratio
+except ImportError:
+    from difflib import SequenceMatcher
+    def ratio(a: str, b: str) -> float:
+        return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
 YEAR_RE = re.compile(r"^(\d{4})$")
@@ -50,7 +57,8 @@ def find_problem_albums(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     return cur.fetchall()
 
 
-def lookup_year_discogs(artist: str, album: str, token: Optional[str], user_agent: str) -> Optional[tuple]:
+def lookup_year_discogs(artist: str, album: str, token: Optional[str], user_agent: str) -> Optional[Tuple[str, str, str, str]]:
+    """Return (year, url, artist_name, album_name) from Discogs or None."""
     if not artist and not album:
         return None
     url = "https://api.discogs.com/database/search"
@@ -71,18 +79,23 @@ def lookup_year_discogs(artist: str, album: str, token: Optional[str], user_agen
     results = data.get("results", [])
     years = []
     result_url = None
+    result_artist = None
+    result_album = None
     for res in results:
         y = res.get("year")
         if isinstance(y, int) and 1000 <= y <= 9999:
             years.append(y)
             if not result_url:
                 result_url = res.get("uri")
+                result_artist = res.get("artist", "")
+                result_album = res.get("title", "")
     if years:
-        return (str(min(years)), result_url)
+        return (str(min(years)), result_url, result_artist or "", result_album or "")
     return None
 
 
-def lookup_year_mb(artist: str, album: str) -> Optional[tuple]:
+def lookup_year_mb(artist: str, album: str) -> Optional[Tuple[str, str, str, str]]:
+    """Return (year, url, artist_name, album_name) from MusicBrainz or None."""
     try:
         res = musicbrainzngs.search_release_groups(artist=artist or "", releasegroup=album or "", limit=5)
     except Exception:
@@ -90,6 +103,8 @@ def lookup_year_mb(artist: str, album: str) -> Optional[tuple]:
     rgs = res.get("release-group-list", [])
     years = []
     result_url = None
+    result_artist = None
+    result_album = None
     for rg in rgs:
         d = rg.get("first-release-date")
         if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
@@ -98,8 +113,10 @@ def lookup_year_mb(artist: str, album: str) -> Optional[tuple]:
                 years.append(int(m.group(1)))
                 if not result_url:
                     result_url = f"https://musicbrainz.org/release-group/{rg.get("id")}"
+                    result_artist = rg.get("artist-credit-phrase", "")
+                    result_album = rg.get("title", "")
     if years:
-        return (str(min(years)), result_url)
+        return (str(min(years)), result_url, result_artist or "", result_album or "")
 
     try:
         r = musicbrainzngs.search_releases(artist=artist or "", release=album or "", limit=5)
@@ -109,6 +126,8 @@ def lookup_year_mb(artist: str, album: str) -> Optional[tuple]:
     for rel in rels:
         if not result_url:
             result_url = f"https://musicbrainz.org/release/{rel.get("id")}" if rel.get("id") else None
+            result_artist = rel.get("artist-credit-phrase", "")
+            result_album = rel.get("title", "")
         # prefer release-events which have structured dates
         events = rel.get("release-event-list", [])
         for event in events:
@@ -126,8 +145,16 @@ def lookup_year_mb(artist: str, album: str) -> Optional[tuple]:
                 if m:
                     years.append(int(m.group(1)))
     if years:
-        return (str(min(years)), result_url)
+        return (str(min(years)), result_url, result_artist or "", result_album or "")
     return None
+
+
+def check_similarity(db_artist: str, db_album: str, api_artist: str, api_album: str, threshold: float = 0.7) -> bool:
+    """Check if API results match DB values using Levenshtein distance. Returns True if similar enough."""
+    artist_sim = ratio(db_artist, api_artist) if db_artist and api_artist else 0.0
+    album_sim = ratio(db_album, api_album) if db_album and api_album else 0.0
+    avg_sim = (artist_sim + album_sim) / 2.0
+    return avg_sim >= threshold
 
 
 def find_mp3_files(conn: sqlite3.Connection, album_id: str, media_root: Optional[str]) -> List[str]:
@@ -229,6 +256,7 @@ def main(argv=None):
     parser.add_argument('--media-root', help='Prefix to join with media_file.path when path is relative', default=None)
     parser.add_argument('--state-file', help='JSON file to track processed albums', default='update_years_state.json')
     parser.add_argument('--force', help='Reprocess albums even if present in state file', action='store_true')
+    parser.add_argument('--similarity-threshold', help='Minimum Levenshtein similarity (0-1) for artist/album match', type=float, default=0.7)
     parser.add_argument('--dry-run', help="Don't write tags; just print what would be done", action='store_true')
     args = parser.parse_args(argv)
 
@@ -295,19 +323,26 @@ def main(argv=None):
         print('Current date field:', repr(cur_date))
         year = None
         source_url = None
+        api_artist = None
+        api_album = None
         # Try Discogs first
         try:
             result = lookup_year_discogs(artist, name, args.discogs_token, args.user_agent)
             if result:
-                year, source_url = result
+                year, source_url, api_artist, api_album = result
         except Exception:
             year = None
         if not year:
             result = lookup_year_mb(artist, name)
             if result:
-                year, source_url = result
+                year, source_url, api_artist, api_album = result
         if not year:
             print('Could not find a reliable year via Discogs/MusicBrainz.')
+            continue
+        # Check similarity between DB values and API results
+        if not check_similarity(artist, name, api_artist, api_album, args.similarity_threshold):
+            print(f'Skipping: Low similarity match (API: {api_artist} - {api_album})')
+            mark_processed(state, album_id, name, artist, year, 'skipped_mismatch', args.dry_run)
             continue
         print('Discovered year:', year)
         if source_url:
