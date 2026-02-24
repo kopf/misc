@@ -28,6 +28,8 @@ import requests
 import musicbrainzngs
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TDRC, ID3NoHeaderError
+import json
+from datetime import datetime
 
 
 YEAR_RE = re.compile(r"^(\d{4})$")
@@ -206,6 +208,8 @@ def main(argv=None):
     parser.add_argument('--user-agent', help='User-Agent for web APIs', default='albums-missing-year-script/0.1 (example@example.com)')
     parser.add_argument('--discogs-token', help='Discogs personal access token (optional)', default=None)
     parser.add_argument('--media-root', help='Prefix to join with media_file.path when path is relative', default=None)
+    parser.add_argument('--state-file', help='JSON file to track processed albums', default='update_years_state.json')
+    parser.add_argument('--force', help='Reprocess albums even if present in state file', action='store_true')
     parser.add_argument('--dry-run', help="Don't write tags; just print what would be done", action='store_true')
     args = parser.parse_args(argv)
 
@@ -216,6 +220,40 @@ def main(argv=None):
     musicbrainzngs.set_useragent('albums-missing-year-script', '0.1', args.user_agent)
 
     conn = sqlite3.connect(args.db)
+
+    # load state of processed albums
+    def load_state(path: str):
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+
+    def save_state(path: str, data: dict):
+        tmp = path + '.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def mark_processed(state: dict, album_id: str, name: str, artist: str, year: str, decision: str, dry_run: bool):
+        state[album_id] = {
+            'name': name,
+            'artist': artist,
+            'year': year,
+            'decision': decision,
+            'dry_run': bool(dry_run),
+            'timestamp': datetime.utcnow().isoformat() + 'Z'
+        }
+        save_state(args.state_file, state)
+
+    state = load_state(args.state_file)
 
     albums = find_problem_albums(conn)
     if not albums:
@@ -229,6 +267,10 @@ def main(argv=None):
         name = alb['name']
         artist = alb['album_artist']
         cur_date = alb['date']
+        # skip if processed already unless --force
+        if not args.force and album_id in state:
+            print(f"Skipping already-processed album: {name} ({album_id}) -> {state[album_id].get('decision')}")
+            continue
         print('\nAlbum:', name)
         print('Artist:', artist)
         print('Current date field:', repr(cur_date))
@@ -241,7 +283,7 @@ def main(argv=None):
         if not year:
             year = lookup_year_mb(artist, name)
         if not year:
-            print('Could not find a reliable year via MusicBrainz.')
+            print('Could not find a reliable year via Discogs/MusicBrainz.')
             continue
         print('Discovered year:', year)
         mp3s = find_mp3_files(conn, album_id, args.media_root)
@@ -268,6 +310,8 @@ def main(argv=None):
                 break
 
         if do_apply:
+            # record decision as 'accepted'
+            mark_processed(state, album_id, name, artist, year, 'accepted', args.dry_run)
             if args.dry_run:
                 for p in mp3s:
                     print('Would update:', p)
@@ -275,6 +319,9 @@ def main(argv=None):
             for p in mp3s:
                 ok = set_id3_year(p, year)
                 print(('Updated' if ok else 'Failed to update'), p)
+        else:
+            # record decision as 'rejected'
+            mark_processed(state, album_id, name, artist, year, 'rejected', args.dry_run)
 
     conn.close()
 
