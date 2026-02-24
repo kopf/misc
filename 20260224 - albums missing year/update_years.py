@@ -108,57 +108,64 @@ def lookup_year_discogs(artist: str, album: str, token: Optional[str], user_agen
 
 
 def lookup_year_mb(artist: str, album: str) -> Optional[Tuple[str, str, str, str]]:
-    """Return (year, url, artist_name, album_name) from MusicBrainz or None."""
-    try:
-        res = musicbrainzngs.search_release_groups(artist=artist or "", releasegroup=album or "", limit=5)
-    except Exception:
-        return None
-    rgs = res.get("release-group-list", [])
-    years = []
+    """Return (year, url, artist_name, album_name) from MusicBrainz or None.
+    Prioritizes actual release dates (release-events) over release group first-release-date.
+    """
     result_url = None
     result_artist = None
     result_album = None
-    for rg in rgs:
-        d = rg.get("first-release-date")
-        if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
-            m = re.match(r"^(\d{4})", d)
-            if m:
-                years.append(int(m.group(1)))
-                if not result_url:
+
+    # Search releases first (more authoritative dates via release-events)
+    try:
+        r = musicbrainzngs.search_releases(artist=artist or "", release=album or "", limit=10)
+        rels = r.get("release-list", [])
+        for rel in rels:
+            # prefer release-events which have actual structured dates
+            events = rel.get("release-event-list", [])
+            for event in events:
+                d = event.get("date")
+                if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
+                    m = re.match(r"^(\d{4})", d)
+                    if m:
+                        year = int(m.group(1))
+                        result_url = f"https://musicbrainz.org/release/{rel.get("id")}" if rel.get("id") else None
+                        result_artist = rel.get("artist-credit-phrase", "")
+                        result_album = rel.get("title", "")
+                        # Return immediately on first valid date found
+                        return (str(year), result_url, result_artist or "", result_album or "")
+            # fallback to top-level date if no events found
+            if not events:
+                d = rel.get("date")
+                if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
+                    m = re.match(r"^(\d{4})", d)
+                    if m:
+                        year = int(m.group(1))
+                        result_url = f"https://musicbrainz.org/release/{rel.get("id")}" if rel.get("id") else None
+                        result_artist = rel.get("artist-credit-phrase", "")
+                        result_album = rel.get("title", "")
+                        # Return immediately on first valid date found
+                        return (str(year), result_url, result_artist or "", result_album or "")
+    except Exception:
+        pass
+
+    # Fallback to release groups if release search didn't yield results
+    try:
+        res = musicbrainzngs.search_release_groups(artist=artist or "", releasegroup=album or "", limit=5)
+        rgs = res.get("release-group-list", [])
+        for rg in rgs:
+            d = rg.get("first-release-date")
+            if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
+                m = re.match(r"^(\d{4})", d)
+                if m:
+                    year = int(m.group(1))
                     result_url = f"https://musicbrainz.org/release-group/{rg.get("id")}"
                     result_artist = rg.get("artist-credit-phrase", "")
                     result_album = rg.get("title", "")
-    if years:
-        return (str(min(years)), result_url, result_artist or "", result_album or "")
-
-    try:
-        r = musicbrainzngs.search_releases(artist=artist or "", release=album or "", limit=5)
+                    # Return immediately on first valid date found
+                    return (str(year), result_url, result_artist or "", result_album or "")
     except Exception:
-        return None
-    rels = r.get("release-list", [])
-    for rel in rels:
-        if not result_url:
-            result_url = f"https://musicbrainz.org/release/{rel.get("id")}" if rel.get("id") else None
-            result_artist = rel.get("artist-credit-phrase", "")
-            result_album = rel.get("title", "")
-        # prefer release-events which have structured dates
-        events = rel.get("release-event-list", [])
-        for event in events:
-            d = event.get("date")
-            if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
-                m = re.match(r"^(\d{4})", d)
-                if m:
-                    years.append(int(m.group(1)))
-                    break  # take first valid event date
-        # fallback to top-level date if no events found
-        if not events:
-            d = rel.get("date")
-            if d and re.match(r"^\d{4}-\d{2}-\d{2}", d):  # validate YYYY-MM-DD format
-                m = re.match(r"^(\d{4})", d)
-                if m:
-                    years.append(int(m.group(1)))
-    if years:
-        return (str(min(years)), result_url, result_artist or "", result_album or "")
+        pass
+
     return None
 
 
