@@ -92,21 +92,44 @@ class Substrate:
         self.cracks.append(self._create_new_crack_data())
 
     def _create_new_crack_data(self) -> Crack:
-        # Try to find a starting point on an existing crack
-        start_x, start_y = random.uniform(0, self.width), random.uniform(0, self.height)
-        start_angle = random.uniform(0, 360)
+        # Try to find a starting point that respects min_dist from other active cracks
+        best_x, best_y = random.uniform(0, self.width), random.uniform(0, self.height)
+        best_angle = random.uniform(0, 360)
         
-        # Search by sampling as in original C code
-        for _ in range(10000):
-            px, py = random.randint(0, self.width - 1), random.randint(0, self.height - 1)
-            grid_val = self.grid[px, py]
-            if grid_val < 10000:
-                start_x, start_y = float(px), float(py)
-                # Branch perpendicularly (±90 deg)
-                branch_dir = random.choice([-90.0, 90.0])
-                start_angle = (grid_val + branch_dir + random.uniform(-2.0, 2.0)) % 360.0
-                break
-        
+        # We try multiple times to find a good starting point
+        for attempt in range(100):
+            curr_x, curr_y = random.uniform(0, self.width), random.uniform(0, self.height)
+            curr_angle = random.uniform(0, 360)
+            found_on_grid = False
+            
+            # 1. Try to find a point on the grid (branching)
+            # Sample fewer times per attempt to keep it fast but effective
+            for _ in range(100):
+                px, py = random.randint(0, self.width - 1), random.randint(0, self.height - 1)
+                grid_val = self.grid[px, py]
+                if grid_val < 10000:
+                    curr_x, curr_y = float(px), float(py)
+                    branch_dir = random.choice([-90.0, 90.0])
+                    curr_angle = (grid_val + branch_dir + random.uniform(-2.0, 2.0)) % 360.0
+                    found_on_grid = True
+                    break
+            
+            # 2. Check distance from other active cracks
+            if self.args.min_dist > 0:
+                too_close = False
+                for other in self.cracks:
+                    if other.is_alive:
+                        dist_sq = (curr_x - other.x)**2 + (curr_y - other.y)**2
+                        if dist_sq < self.args.min_dist**2:
+                            too_close = True
+                            break
+                if too_close:
+                    continue # Try another attempt
+            
+            # If we got here, it's a valid point (either far enough or we don't care about min_dist)
+            best_x, best_y, best_angle = curr_x, curr_y, curr_angle
+            break
+
         is_circular = random.randint(0, 100) < self.args.circle_percent
         radius = 0.0
         if is_circular:
@@ -115,9 +138,9 @@ class Substrate:
                 radius *= -1.0
         
         return Crack(
-            x=start_x,
-            y=start_y,
-            angle=start_angle,
+            x=best_x,
+            y=best_y,
+            angle=best_angle,
             sand_color=random.choice(self.palette),
             is_circular=is_circular,
             radius=radius,
@@ -227,6 +250,10 @@ class Substrate:
         clock = pygame.time.Clock()
         running = True
         
+        # Attempt to focus window
+        pygame.event.pump()
+        pygame.display.flip()
+        
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -253,6 +280,7 @@ def main():
     parser = argparse.ArgumentParser(description="Python version of XScreensaver Substrate")
     parser.add_argument("--initial-cracks", type=int, default=3, help="Starting number of cracks")
     parser.add_argument("--max-cracks", type=int, default=100, help="Maximum concurrent cracks")
+    parser.add_argument("--min-dist", type=float, default=10.0, help="Minimum distance between new crack starts and existing cracks")
     parser.add_argument("--sand-grains", type=int, default=64, help="Number of grains for coloring")
     parser.add_argument("--circle-percent", type=int, default=33, help="Percentage of circular cracks")
     parser.add_argument("--max-cycles", type=int, default=10000, help="Steps before reset")
