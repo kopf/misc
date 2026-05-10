@@ -60,9 +60,9 @@ class Substrate:
         # Grid to store crack angles for collision detection
         self.grid = np.full((width, height), EMPTY_GRID, dtype=np.float32)
         
-        # Surface for sand painting (needs alpha)
-        self.sand_surface = pygame.Surface((width, height), pygame.SRCALPHA)
-        self.sand_surface.fill((0, 0, 0, 0))
+        # Persistent surface for all drawing (needs alpha for sand painting)
+        self.draw_surface = pygame.Surface((width, height), pygame.SRCALPHA)
+        self.draw_surface.fill((0, 0, 0, 0))
         
         self.cracks: List[Crack] = []
         self.palette = [pygame.Color(c) for c in POLLOCK_PALETTE]
@@ -72,7 +72,7 @@ class Substrate:
 
     def reset(self):
         self.screen.fill(self.bg_color)
-        self.sand_surface.fill((0, 0, 0, 0))
+        self.draw_surface.fill((0, 0, 0, 0))
         self.grid.fill(EMPTY_GRID)
         self.cracks = []
         self.cycles = 0
@@ -93,7 +93,6 @@ class Substrate:
 
     def _create_new_crack_data(self) -> Crack:
         # Try to find a starting point on an existing crack
-        found = False
         start_x, start_y = random.uniform(0, self.width), random.uniform(0, self.height)
         start_angle = random.uniform(0, 360)
         
@@ -106,10 +105,7 @@ class Substrate:
                 # Branch perpendicularly (±90 deg)
                 branch_dir = random.choice([-90.0, 90.0])
                 start_angle = (grid_val + branch_dir + random.uniform(-2.0, 2.0)) % 360.0
-                found = True
                 break
-        
-        # If not found, it stays random as initialized above
         
         is_circular = random.randint(0, 100) < self.args.circle_percent
         radius = 0.0
@@ -118,13 +114,11 @@ class Substrate:
             if random.random() < 0.5:
                 radius *= -1.0
         
-        sand_color = random.choice(self.palette)
-        
         return Crack(
             x=start_x,
             y=start_y,
             angle=start_angle,
-            sand_color=sand_color,
+            sand_color=random.choice(self.palette),
             is_circular=is_circular,
             radius=radius,
             sandg=random.uniform(0.0, 1.0)
@@ -135,6 +129,8 @@ class Substrate:
             self.reset()
             return
 
+        new_cracks_needed = 0
+        
         for crack in self.cracks:
             if not crack.is_alive:
                 continue
@@ -153,31 +149,37 @@ class Substrate:
             # Check bounds
             if not (0 <= crack.x < self.width and 0 <= crack.y < self.height):
                 crack.is_alive = False
-                self.add_crack()
-                self.add_crack()
+                new_cracks_needed += 2
                 continue
             
             # Check collision
             ix, iy = int(crack.x), int(crack.y)
             grid_angle = self.grid[ix, iy]
-            if grid_angle < 10000:
-                # Collision if angle is different enough
-                if abs(grid_angle - crack.angle) > 2.0:
+            if not self.args.no_stop and grid_angle < 10000:
+                # Collision if angle is different enough (handles wrap-around)
+                diff = abs(grid_angle - crack.angle) % 360
+                if diff > 180:
+                    diff = 360 - diff
+                
+                if diff > 2.0:
                     crack.is_alive = False
-                    self.add_crack()
-                    self.add_crack()
+                    new_cracks_needed += 2
                     continue
             
             # Record current angle in grid
             self.grid[ix, iy] = crack.angle
             
-            # Draw crack line
-            pygame.draw.line(self.screen, self.fg_color, (old_x, old_y), (crack.x, crack.y), 1)
-            
-            # Sand painting (coloring)
+            # Sand painting (coloring) - Draw sand first so crack is on top
             if not self.args.wireframe:
                 self.paint_sand(crack)
+
+            # Draw crack line
+            pygame.draw.line(self.draw_surface, self.fg_color, (old_x, old_y), (crack.x, crack.y), 1)
         
+        # Add new cracks requested by collisions/deaths
+        for _ in range(new_cracks_needed):
+            self.add_crack()
+            
         self.cycles += 1
 
     def paint_sand(self, crack: Crack):
@@ -217,9 +219,9 @@ class Substrate:
                 # Alpha in original is 0.1 down to 0.0
                 alpha_val = max(0, int(30 - (i / grains) * 30))
                 
-                # Draw small pixel on sand surface
+                # Draw small pixel on surface
                 color = list(crack.sand_color[:3]) + [alpha_val]
-                self.sand_surface.set_at((int(gx), int(gy)), color)
+                self.draw_surface.set_at((int(gx), int(gy)), color)
 
     def run(self):
         clock = pygame.time.Clock()
@@ -237,17 +239,15 @@ class Substrate:
 
             self.step()
             
-            # Blit sand surface onto main screen
-            self.screen.blit(self.sand_surface, (0, 0))
+            # Draw background then the persistent drawing surface
+            self.screen.fill(self.bg_color)
+            self.screen.blit(self.draw_surface, (0, 0))
             
             pygame.display.flip()
             
             if self.args.growth_delay > 0:
                 # growth_delay is in microseconds, convert to ms
                 pygame.time.delay(self.args.growth_delay // 1000)
-            
-            # clock.tick() could be used to cap FPS, but growth_delay handles speed
-            # clock.tick(60)
 
 def main():
     parser = argparse.ArgumentParser(description="Python version of XScreensaver Substrate")
@@ -258,6 +258,7 @@ def main():
     parser.add_argument("--max-cycles", type=int, default=10000, help="Steps before reset")
     parser.add_argument("--growth-delay", type=int, default=18000, help="Delay between steps (microseconds)")
     parser.add_argument("--wireframe", action="store_true", help="Draw only lines, no coloring")
+    parser.add_argument("--no-stop", action="store_true", help="Cracks do not stop when hitting other cracks")
     parser.add_argument("--background", type=str, default="white", help="Background color")
     parser.add_argument("--foreground", type=str, default="black", help="Foreground (crack) color")
     parser.add_argument("--width", type=int, default=1024, help="Screen width")
