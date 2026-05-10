@@ -33,8 +33,7 @@ This repository contains a collection of self-contained, once-off Python scripts
 
 ## Git & File Management
 
-- **Ignore Generated Files:** If a script generates output files (plots, logs, CSVs), create a `.gitignore` file within that script's directory to ignore them.
-  - Example `.gitignore` content: `*.png`, `*.log`, `output/`.
+- **Ignore Generated Files:** If a script generates output files (e.g. plots, logs, CSVs), only then create a `.gitignore` file within that script's directory to ignore them.
 - **No Staging:** Do not stage or commit changes unless explicitly requested.
 
 ## Workflow for New Scripts
