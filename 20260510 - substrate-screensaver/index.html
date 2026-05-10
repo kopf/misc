@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Substrate Screensaver</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #000;
+            color: #fff;
+            font-family: monospace;
+        }
+        canvas {
+            display: block;
+        }
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 5px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        body:hover #controls {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        .control-group {
+            margin-bottom: 5px;
+        }
+        label {
+            display: inline-block;
+            width: 120px;
+        }
+        input {
+            width: 100px;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="controls">
+        <div class="control-group">
+            <label>Initial Cracks:</label>
+            <input type="number" id="initialCracks" value="3">
+        </div>
+        <div class="control-group">
+            <label>Max Cracks:</label>
+            <input type="number" id="maxCracks" value="100">
+        </div>
+        <div class="control-group">
+            <label>Min Dist:</label>
+            <input type="number" id="minDist" value="10">
+        </div>
+        <div class="control-group">
+            <label>Sand Grains:</label>
+            <input type="number" id="sandGrains" value="64">
+        </div>
+        <div class="control-group">
+            <label>Circle %:</label>
+            <input type="number" id="circlePercent" value="33">
+        </div>
+        <div class="control-group">
+            <button id="resetBtn">Reset (R)</button>
+        </div>
+        <div style="font-size: 0.8em; margin-top: 10px;">
+            Hover to show controls.<br>
+            Press 'R' to reset.<br>
+            Press 'F' for fullscreen.
+        </div>
+    </div>
+
+    <script>
+        const POLLOCK_PALETTE = [
+            "#201F21", "#262C2E", "#352626", "#372B27", "#302C2E", "#392B2D", "#323229", "#3F3229",
+            "#38322E", "#2E333D", "#333A3D", "#473329", "#403433", "#4A362D", "#3B3831", "#3E3B33",
+            "#4D373B", "#423E3E", "#503E31", "#444133", "#454436", "#50433E", "#4C4640", "#47494A",
+            "#59483C", "#5C4B4B", "#525043", "#56524A", "#5B5552", "#66503E", "#645543", "#68584B",
+            "#625C51", "#6A5E57", "#6C6552", "#716352", "#776752", "#73695B", "#796C61", "#6D727A",
+            "#767571", "#7B776E", "#83745D", "#897664", "#847B6A", "#8D7F73", "#828374", "#8B8679",
+            "#95856F", "#9A8C7A", "#96917B", "#9A9586", "#A19888", "#9099A2", "#A29F91", "#AA9F8C",
+            "#B0A391", "#B6A795", "#A6A99D", "#B3AE9D", "#BCB39E", "#BDB7AB", "#C6BBA8", "#C7C2B4",
+            "#BDC3C9", "#CBCFD2", "#D2C9B9", "#D9D2C3", "#DAD7C9", "#E1DDD2", "#EAE6DA", "#F2EEE4",
+            "#F8F2C7", "#EFEFD0"
+        ];
+
+        const EMPTY_GRID = 10001.0;
+
+        class Crack {
+            constructor(x, y, angle, sandColor, isCircular = false, radius = 0, sandg = 0) {
+                this.x = x;
+                this.y = y;
+                this.angle = angle;
+                this.sandColor = sandColor;
+                this.isCircular = isCircular;
+                this.radius = radius;
+                this.sandp = 0.0;
+                this.sandg = sandg;
+                this.isAlive = true;
+            }
+        }
+
+        class Substrate {
+            constructor(canvasId) {
+                this.canvas = document.getElementById(canvasId);
+                this.ctx = this.canvas.getContext('2d', { alpha: false });
+                
+                // Persistent drawing surface
+                this.drawCanvas = document.createElement('canvas');
+                this.drawCtx = this.drawCanvas.getContext('2d');
+
+                this.params = {
+                    initialCracks: 3,
+                    maxCracks: 100,
+                    minDist: 10.0,
+                    sandGrains: 64,
+                    circlePercent: 33,
+                    maxCycles: 10000,
+                    background: '#ffffff',
+                    foreground: '#000000'
+                };
+
+                this.palette = POLLOCK_PALETTE;
+                this.cracks = [];
+                this.grid = null;
+                this.cycles = 0;
+
+                window.addEventListener('resize', () => this.handleResize());
+                this.handleResize();
+                this.reset();
+            }
+
+            handleResize() {
+                this.width = window.innerWidth;
+                this.height = window.innerHeight;
+                this.canvas.width = this.width;
+                this.canvas.height = this.height;
+                this.drawCanvas.width = this.width;
+                this.drawCanvas.height = this.height;
+                
+                // Re-initialize grid on resize
+                this.grid = new Float32Array(this.width * this.height);
+                this.reset();
+            }
+
+            reset() {
+                this.params.initialCracks = parseInt(document.getElementById('initialCracks').value) || 3;
+                this.params.maxCracks = parseInt(document.getElementById('maxCracks').value) || 100;
+                this.params.minDist = parseFloat(document.getElementById('minDist').value) || 10.0;
+                this.params.sandGrains = parseInt(document.getElementById('sandGrains').value) || 64;
+                this.params.circlePercent = parseInt(document.getElementById('circlePercent').value) || 33;
+
+                this.drawCtx.fillStyle = this.params.background;
+                this.drawCtx.fillRect(0, 0, this.width, this.height);
+                this.grid.fill(EMPTY_GRID);
+                this.cracks = [];
+                this.cycles = 0;
+
+                for (let i = 0; i < this.params.initialCracks; i++) {
+                    this.addCrack();
+                }
+            }
+
+            addCrack() {
+                if (this.cracks.length >= this.params.maxCracks) {
+                    for (let i = 0; i < this.cracks.length; i++) {
+                        if (!this.cracks[i].isAlive) {
+                            this.cracks[i] = this.createNewCrackData();
+                            return;
+                        }
+                    }
+                    return;
+                }
+                this.cracks.push(this.createNewCrackData());
+            }
+
+            createNewCrackData() {
+                let bestX = Math.random() * this.width;
+                let bestY = Math.random() * this.height;
+                let bestAngle = Math.random() * 360;
+
+                for (let attempt = 0; attempt < 100; attempt++) {
+                    let currX = Math.random() * this.width;
+                    let currY = Math.random() * this.height;
+                    let currAngle = Math.random() * 360;
+                    let foundOnGrid = false;
+
+                    for (let g = 0; g < 100; g++) {
+                        let px = Math.floor(Math.random() * this.width);
+                        let py = Math.floor(Math.random() * this.height);
+                        let gridVal = this.grid[py * this.width + px];
+                        if (gridVal < 10000) {
+                            currX = px;
+                            currY = py;
+                            let branchDir = Math.random() < 0.5 ? -90.0 : 90.0;
+                            currAngle = (gridVal + branchDir + (Math.random() * 4.0 - 2.0)) % 360.0;
+                            foundOnGrid = true;
+                            break;
+                        }
+                    }
+
+                    if (this.params.minDist > 0) {
+                        let tooClose = false;
+                        for (let other of this.cracks) {
+                            if (other.isAlive) {
+                                let distSq = Math.pow(currX - other.x, 2) + Math.pow(currY - other.y, 2);
+                                if (distSq < Math.pow(this.params.minDist, 2)) {
+                                    tooClose = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (tooClose) continue;
+                    }
+
+                    bestX = currX;
+                    bestY = currY;
+                    bestAngle = bestAngle; // wait, in python it was curr_angle
+                    bestAngle = currAngle;
+                    break;
+                }
+
+                let isCircular = (Math.random() * 100) < this.params.circlePercent;
+                let radius = 0;
+                if (isCircular) {
+                    radius = 10.0 + Math.random() * ((this.width + this.height) / 2.0);
+                    if (Math.random() < 0.5) radius *= -1.0;
+                }
+
+                const color = this.palette[Math.floor(Math.random() * this.palette.length)];
+                return new Crack(bestX, bestY, bestAngle, color, isCircular, radius, Math.random());
+            }
+
+            step() {
+                if (this.cycles >= this.params.maxCycles) {
+                    this.reset();
+                    return;
+                }
+
+                let newCracksNeeded = 0;
+
+                for (let crack of this.cracks) {
+                    if (!crack.isAlive) continue;
+
+                    let oldX = crack.x;
+                    let oldY = crack.y;
+
+                    let stepSize = 0.42;
+                    if (crack.isCircular) {
+                        let radianInc = stepSize / crack.radius;
+                        crack.angle = (crack.angle + (radianInc * 180 / Math.PI)) % 360.0;
+                    }
+
+                    crack.x += stepSize * Math.cos(crack.angle * Math.PI / 180);
+                    crack.y += stepSize * Math.sin(crack.angle * Math.PI / 180);
+
+                    // Bounds check
+                    if (crack.x < 0 || crack.x >= this.width || crack.y < 0 || crack.y >= this.height) {
+                        crack.isAlive = false;
+                        newCracksNeeded += 2;
+                        continue;
+                    }
+
+                    // Collision
+                    let ix = Math.floor(crack.x);
+                    let iy = Math.floor(crack.y);
+                    let gridAngle = this.grid[iy * this.width + ix];
+
+                    if (gridAngle < 10000) {
+                        let diff = Math.abs(gridAngle - crack.angle) % 360;
+                        if (diff > 180) diff = 360 - diff;
+
+                        if (diff > 2.0) {
+                            crack.isAlive = false;
+                            newCracksNeeded += 2;
+                            continue;
+                        }
+                    }
+
+                    this.grid[iy * this.width + ix] = crack.angle;
+
+                    this.paintSand(crack);
+
+                    // Draw crack line
+                    this.drawCtx.strokeStyle = this.params.foreground;
+                    this.drawCtx.lineWidth = 1;
+                    this.drawCtx.beginPath();
+                    this.drawCtx.moveTo(oldX, oldY);
+                    this.drawCtx.lineTo(crack.x, crack.y);
+                    this.drawCtx.stroke();
+                }
+
+                for (let i = 0; i < newCracksNeeded; i++) {
+                    this.addCrack();
+                }
+
+                this.cycles++;
+            }
+
+            paintSand(crack) {
+                let angleRad = (crack.angle + 90) * Math.PI / 180;
+                let dx = Math.cos(angleRad);
+                let dy = Math.sin(angleRad);
+
+                let hitX = crack.x;
+                let hitY = crack.y;
+
+                let maxDist = 200;
+                for (let dist = 1; dist < maxDist; dist++) {
+                    let tx = Math.floor(crack.x + dx * dist);
+                    let ty = Math.floor(crack.y + dy * dist);
+
+                    if (tx < 0 || tx >= this.width || ty < 0 || ty >= this.height) {
+                        hitX = crack.x + dx * dist;
+                        hitY = crack.y + dy * dist;
+                        break;
+                    }
+
+                    if (this.grid[ty * this.width + tx] < 10000) {
+                        hitX = tx;
+                        hitY = ty;
+                        break;
+                    }
+
+                    if (dist === maxDist - 1) {
+                        hitX = crack.x + dx * maxDist;
+                        hitY = crack.y + dy * maxDist;
+                    }
+                }
+
+                let grains = this.params.sandGrains;
+                let w = grains > 1 ? crack.sandg / (grains - 1) : 0;
+
+                for (let i = 0; i < grains; i++) {
+                    let t = Math.sin(crack.sandp + Math.sin(i * w));
+                    let gx = crack.x + (hitX - crack.x) * t;
+                    let gy = crack.y + (hitY - crack.y) * t;
+
+                    if (gx >= 0 && gx < this.width && gy >= 0 && gy < this.height) {
+                        let alpha = Math.max(0, 0.12 - (i / grains) * 0.12);
+                        this.drawCtx.fillStyle = crack.sandColor + Math.floor(alpha * 255).toString(16).padStart(2, '0');
+                        this.drawCtx.fillRect(gx, gy, 1, 1);
+                    }
+                }
+            }
+
+            run() {
+                const animate = () => {
+                    // Perform multiple steps per frame to speed it up (like pygame's loop speed)
+                    for (let i = 0; i < 5; i++) {
+                        this.step();
+                    }
+                    this.ctx.drawImage(this.drawCanvas, 0, 0);
+                    requestAnimationFrame(animate);
+                };
+                requestAnimationFrame(animate);
+            }
+        }
+
+        const substrate = new Substrate('canvas');
+        substrate.run();
+
+        document.getElementById('resetBtn').addEventListener('click', () => substrate.reset());
+        
+        window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'r') {
+                substrate.reset();
+            } else if (e.key.toLowerCase() === 'f') {
+                if (!document.fullscreenElement) {
+                    document.documentElement.requestFullscreen();
+                } else {
+                    document.exitFullscreen();
+                }
+            }
+        });
+    </script>
+</body>
+</html>
+ document.exitFullscreen();
+                }
+            }
+        });
+    </script>
+</body>
+</html>
+     }
+        });
+    </script>
+</body>
+</html>
