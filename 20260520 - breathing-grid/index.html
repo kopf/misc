@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Breathing Grid</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+        }
+        canvas {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gridCanvas"></canvas>
+    <script>
+        const canvas = document.getElementById('gridCanvas');
+        const ctx = canvas.getContext('2d');
+
+        let squares = [];
+        let squareSize = 50;
+        let gap = 2;
+        let hue = Math.floor(Math.random() * 360);
+        
+        // Randomize overall pace: from 0.3 (very slow) to 2.0 (busy)
+        const globalSpeedFactor = 0.3 + Math.random() * 1.7;
+
+        class Square {
+            constructor(x, y, size, saturation, lightness) {
+                this.x = x;
+                this.y = y;
+                this.size = size;
+                this.saturation = saturation;
+                this.lightness = lightness;
+                
+                // Breathing state
+                this.phase = Math.random() * Math.PI * 2;
+                // Base frequency scaled by global speed
+                this.baseFrequency = (0.005 + Math.random() * 0.02) * globalSpeedFactor;
+                this.frequency = this.baseFrequency;
+                this.frequencyTarget = this.baseFrequency;
+                this.freqLerpSpeed = (0.0005 + Math.random() * 0.001) * globalSpeedFactor;
+            }
+
+            update() {
+                // Smoothly transition frequency toward target
+                if (Math.abs(this.frequency - this.frequencyTarget) < 0.0001) {
+                    // Pick a new target frequency occasionally
+                    if (Math.random() < 0.01) {
+                        this.frequencyTarget = (0.002 + Math.random() * 0.04) * globalSpeedFactor;
+                    }
+                } else {
+                    this.frequency += (this.frequencyTarget - this.frequency) * this.freqLerpSpeed;
+                }
+
+                this.phase += this.frequency;
+                if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
+            }
+
+            draw() {
+                // Opacity oscillates between 0.1 and 0.9
+                const opacity = 0.5 + Math.sin(this.phase) * 0.4;
+                ctx.fillStyle = `hsla(${hue}, ${this.saturation}%, ${this.lightness}%, ${opacity})`;
+                ctx.fillRect(this.x, this.y, this.size, this.size);
+            }
+        }
+
+        function initGrid() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            
+            squares = [];
+            const cols = Math.ceil(canvas.width / (squareSize + gap));
+            const rows = Math.ceil(canvas.height / (squareSize + gap));
+
+            for (let i = 0; i < cols; i++) {
+                for (let j = 0; j < rows; j++) {
+                    const x = i * (squareSize + gap);
+                    const y = j * (squareSize + gap);
+                    // Vary saturation and lightness slightly for depth
+                    const s = 40 + Math.random() * 40;
+                    const l = 30 + Math.random() * 40;
+                    squares.push(new Square(x, y, squareSize, s, l));
+                }
+            }
+        }
+
+        function animate() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            squares.forEach(square => {
+                square.update();
+                square.draw();
+            });
+
+            requestAnimationFrame(animate);
+        }
+
+        window.addEventListener('resize', initGrid);
+
+        // Start
+        initGrid();
+        animate();
+    </script>
+</body>
+</html>
