@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shepard Tone Generator</title>
+    <style>
+        body {
+            margin: 0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background-color: #121212;
+            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        .container {
+            text-align: center;
+            background: #1e1e1e;
+            padding: 2rem;
+            border-radius: 1rem;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+
+        h1 {
+            margin-top: 0;
+            font-weight: 300;
+            letter-spacing: 2px;
+        }
+
+        .status {
+            margin: 1rem 0;
+            font-family: monospace;
+            color: #bb86fc;
+        }
+
+        button {
+            background-color: #bb86fc;
+            color: #000;
+            border: none;
+            padding: 1rem 2rem;
+            font-size: 1.2rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            transition: transform 0.1s, background-color 0.2s;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background-color: #d7b7fd;
+        }
+
+        button:active {
+            transform: scale(0.95);
+        }
+
+        button.playing {
+            background-color: #cf6679;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>Shepard Tone</h1>
+        <div id="status" class="status">Click anywhere to begin</div>
+        <button id="toggleBtn">START</button>
+    </div>
+
+    <script>
+        const NUM_OSCILLATORS = 8;
+        const MIN_FREQ = 27.5; // A0 piano key
+        const MAX_FREQ = 4186; // C8 piano key
+        const OCTAVES = Math.log2(MAX_FREQ / MIN_FREQ);
+
+        let audioCtx = null;
+        let oscillators = [];
+        let gainNodes = [];
+        let isPlaying = false;
+        
+        // Randomize direction and very slow speed
+        const direction = Math.random() > 0.5 ? 1 : -1;
+        const speed = 0.005 + Math.random() * 0.015; // Hundredths of octaves per second
+        
+        const statusEl = document.getElementById('status');
+        const toggleBtn = document.getElementById('toggleBtn');
+
+        function updateStatusDisplay() {
+            statusEl.textContent = `${direction > 0 ? 'Ascending' : 'Descending'} @ ${speed.toFixed(3)} oct/s`;
+        }
+
+        function createPianoWave(ctx) {
+            const real = new Float32Array([0, 1, 0.4, 0.2, 0.1, 0.05, 0.02, 0.01]);
+            const imag = new Float32Array(real.length).fill(0);
+            return ctx.createPeriodicWave(real, imag);
+        }
+
+        function initAudio() {
+            if (audioCtx) return;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            
+            const masterGain = audioCtx.createGain();
+            masterGain.gain.value = 0.2;
+            masterGain.connect(audioCtx.destination);
+
+            const filter = audioCtx.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.frequency.value = 3000;
+            filter.connect(masterGain);
+
+            const pianoWave = createPianoWave(audioCtx);
+
+            for (let i = 0; i < NUM_OSCILLATORS; i++) {
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                
+                osc.setPeriodicWave(pianoWave);
+                osc.connect(gain);
+                gain.connect(filter);
+                
+                oscillators.push(osc);
+                gainNodes.push(gain);
+                osc.start();
+            }
+        }
+
+        let startTime = 0;
+
+        function update() {
+            if (!isPlaying) return;
+
+            const elapsed = audioCtx.currentTime - startTime;
+            const offset = (elapsed * speed * direction) % 1;
+            
+            for (let i = 0; i < NUM_OSCILLATORS; i++) {
+                let pos = (i / NUM_OSCILLATORS + offset) % 1;
+                if (pos < 0) pos += 1;
+
+                const freq = MIN_FREQ * Math.pow(2, pos * OCTAVES);
+                oscillators[i].frequency.exponentialRampToValueAtTime(freq, audioCtx.currentTime + 0.1);
+
+                const volume = Math.pow(Math.sin(pos * Math.PI), 2);
+                gainNodes[i].gain.setTargetAtTime(volume, audioCtx.currentTime, 0.1);
+            }
+
+            requestAnimationFrame(update);
+        }
+
+        async function startAudio() {
+            initAudio();
+            if (audioCtx.state === 'suspended') {
+                await audioCtx.resume();
+            }
+
+            if (!isPlaying) {
+                isPlaying = true;
+                startTime = audioCtx.currentTime;
+                toggleBtn.textContent = 'STOP';
+                toggleBtn.classList.add('playing');
+                updateStatusDisplay();
+                update();
+            }
+        }
+
+        function stopAudio() {
+            if (isPlaying) {
+                isPlaying = false;
+                toggleBtn.textContent = 'START';
+                toggleBtn.classList.remove('playing');
+                gainNodes.forEach(g => g.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1));
+            }
+        }
+
+        // Listen for first interaction to satisfy autoplay policy
+        window.addEventListener('click', () => {
+            if (!isPlaying) startAudio();
+        }, { once: true });
+
+        toggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation(); // Prevent window click from double-triggering
+            if (!isPlaying) startAudio();
+            else stopAudio();
+        });
+
+        // Try to start immediately (might be blocked by browser)
+        window.addEventListener('load', () => {
+            startAudio().catch(() => {
+                console.log('Autoplay blocked, waiting for user interaction.');
+            });
+        });
+    </script>
+    </script>
+</body>
+</html>
