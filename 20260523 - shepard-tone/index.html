@@ -3,94 +3,150 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Shepard Tone Generator</title>
+    <title>Shepard Tone & Breathing Grid</title>
     <style>
-        body {
+        body, html {
             margin: 0;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            background-color: #121212;
-            color: #e0e0e0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         }
-
-        .container {
-            text-align: center;
-            background: #1e1e1e;
-            padding: 2rem;
-            border-radius: 1rem;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        
+        canvas {
+            display: block;
         }
 
-        h1 {
-            margin-top: 0;
-            font-weight: 300;
-            letter-spacing: 2px;
+        #clickHint {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 8rem;
+            font-weight: 900;
+            color: #fff;
+            mix-blend-mode: difference;
+            pointer-events: none;
+            user-select: none;
+            letter-spacing: 1rem;
+            z-index: 10;
         }
 
-        .status {
-            margin: 1rem 0;
-            font-family: monospace;
-            color: #bb86fc;
-        }
-
-        button {
-            background-color: #bb86fc;
-            color: #000;
-            border: none;
-            padding: 1rem 2rem;
-            font-size: 1.2rem;
-            border-radius: 0.5rem;
-            cursor: pointer;
-            transition: transform 0.1s, background-color 0.2s;
-            font-weight: bold;
-        }
-
-        button:hover {
-            background-color: #d7b7fd;
-        }
-
-        button:active {
-            transform: scale(0.95);
-        }
-
-        button.playing {
-            background-color: #cf6679;
+        @media (max-width: 600px) {
+            #clickHint {
+                font-size: 4rem;
+                letter-spacing: 0.5rem;
+            }
         }
     </style>
 </head>
 <body>
-
-    <div class="container">
-        <h1>Shepard Tone</h1>
-        <div id="status" class="status">Click anywhere to begin</div>
-        <button id="toggleBtn">START</button>
-    </div>
+    <div id="clickHint">CLICK</div>
+    <canvas id="gridCanvas"></canvas>
 
     <script>
+        // --- SHARED STATE & RANDOMIZATION ---
+        const sharedSpeedFactor = Math.random(); // 0.0 to 1.0
+        const direction = Math.random() > 0.5 ? 1 : -1;
+        const startPhase = Math.random(); // Randomize where the Shepard Tone cycle starts
+
+        // --- VISUAL ENGINE (BREATHING GRID) ---
+        const canvas = document.getElementById('gridCanvas');
+        const ctx = canvas.getContext('2d');
+        const clickHint = document.getElementById('clickHint');
+
+        let squares = [];
+        let squareSize = 50;
+        let gap = 2;
+        let hue = Math.floor(Math.random() * 360);
+        
+        // Map sharedSpeedFactor to visual speed range: 0.3 to 2.0
+        const globalVisualSpeed = 0.3 + (sharedSpeedFactor * 1.7);
+
+        class Square {
+            constructor(x, y, size, saturation, lightness) {
+                this.x = x;
+                this.y = y;
+                this.size = size;
+                this.saturation = saturation;
+                this.lightness = lightness;
+                this.phase = Math.random() * Math.PI * 2;
+                this.baseFrequency = (0.005 + Math.random() * 0.02) * globalVisualSpeed;
+                this.frequency = this.baseFrequency;
+                this.frequencyTarget = this.baseFrequency;
+                this.freqLerpSpeed = (0.0005 + Math.random() * 0.001) * globalVisualSpeed;
+            }
+
+            update() {
+                if (Math.abs(this.frequency - this.frequencyTarget) < 0.0001) {
+                    if (Math.random() < 0.01) {
+                        this.frequencyTarget = (0.002 + Math.random() * 0.04) * globalVisualSpeed;
+                    }
+                } else {
+                    this.frequency += (this.frequencyTarget - this.frequency) * this.freqLerpSpeed;
+                }
+                this.phase += this.frequency;
+                if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
+            }
+
+            draw() {
+                const opacity = 0.5 + Math.sin(this.phase) * 0.4;
+                ctx.fillStyle = `hsla(${hue}, ${this.saturation}%, ${this.lightness}%, ${opacity})`;
+                ctx.fillRect(this.x, this.y, this.size, this.size);
+            }
+        }
+
+        function initGrid() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            squares = [];
+            const cols = Math.ceil(canvas.width / (squareSize + gap));
+            const rows = Math.ceil(canvas.height / (squareSize + gap));
+            for (let i = 0; i < cols; i++) {
+                for (let j = 0; j < rows; j++) {
+                    const x = i * (squareSize + gap);
+                    const y = j * (squareSize + gap);
+                    const s = 40 + Math.random() * 40;
+                    const l = 30 + Math.random() * 40;
+                    squares.push(new Square(x, y, squareSize, s, l));
+                }
+            }
+            // Initial draw (static)
+            drawFrame();
+        }
+
+        function drawFrame() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            squares.forEach(square => square.draw());
+        }
+
+        function animate() {
+            if (!isPlaying) return;
+            squares.forEach(square => square.update());
+            drawFrame();
+            updateAudio(); // Sync audio update with animation frame
+            requestAnimationFrame(animate);
+        }
+
+        window.addEventListener('resize', initGrid);
+
+
+        // --- AUDIO ENGINE (SHEPARD TONE) ---
         const NUM_OSCILLATORS = 8;
-        const MIN_FREQ = 27.5; // A0 piano key
-        const MAX_FREQ = 4186; // C8 piano key
+        const MIN_FREQ = 27.5; // A0
+        const MAX_FREQ = 4186; // C8
         const OCTAVES = Math.log2(MAX_FREQ / MIN_FREQ);
 
         let audioCtx = null;
         let oscillators = [];
         let gainNodes = [];
         let isPlaying = false;
-        
-        // Randomize direction and very slow speed
-        const direction = Math.random() > 0.5 ? 1 : -1;
-        const speed = 0.005 + Math.random() * 0.015; // Hundredths of octaves per second
-        
-        const statusEl = document.getElementById('status');
-        const toggleBtn = document.getElementById('toggleBtn');
+        let startTime = 0;
 
-        function updateStatusDisplay() {
-            statusEl.textContent = `${direction > 0 ? 'Ascending' : 'Descending'} @ ${speed.toFixed(3)} oct/s`;
-        }
+        // Map sharedSpeedFactor to audio speed range: 0.005 to 0.020 oct/s
+        const audioSpeed = 0.005 + (sharedSpeedFactor * 0.015);
 
         function createPianoWave(ctx) {
             const real = new Float32Array([0, 1, 0.4, 0.2, 0.1, 0.05, 0.02, 0.01]);
@@ -101,97 +157,63 @@
         function initAudio() {
             if (audioCtx) return;
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            
             const masterGain = audioCtx.createGain();
             masterGain.gain.value = 0.2;
             masterGain.connect(audioCtx.destination);
-
             const filter = audioCtx.createBiquadFilter();
             filter.type = 'lowpass';
             filter.frequency.value = 3000;
             filter.connect(masterGain);
-
             const pianoWave = createPianoWave(audioCtx);
-
             for (let i = 0; i < NUM_OSCILLATORS; i++) {
                 const osc = audioCtx.createOscillator();
                 const gain = audioCtx.createGain();
-                
                 osc.setPeriodicWave(pianoWave);
                 osc.connect(gain);
                 gain.connect(filter);
-                
                 oscillators.push(osc);
                 gainNodes.push(gain);
                 osc.start();
             }
         }
 
-        let startTime = 0;
-
-        function update() {
-            if (!isPlaying) return;
-
+        function updateAudio() {
             const elapsed = audioCtx.currentTime - startTime;
-            const offset = (elapsed * speed * direction) % 1;
-            
+            const offset = (startPhase + elapsed * audioSpeed * direction) % 1;
             for (let i = 0; i < NUM_OSCILLATORS; i++) {
                 let pos = (i / NUM_OSCILLATORS + offset) % 1;
                 if (pos < 0) pos += 1;
-
                 const freq = MIN_FREQ * Math.pow(2, pos * OCTAVES);
                 oscillators[i].frequency.exponentialRampToValueAtTime(freq, audioCtx.currentTime + 0.1);
-
                 const volume = Math.pow(Math.sin(pos * Math.PI), 2);
                 gainNodes[i].gain.setTargetAtTime(volume, audioCtx.currentTime, 0.1);
             }
-
-            requestAnimationFrame(update);
         }
 
-        async function startAudio() {
+        async function startEverything() {
+            if (isPlaying) return;
+            
             initAudio();
             if (audioCtx.state === 'suspended') {
                 await audioCtx.resume();
             }
 
-            if (!isPlaying) {
-                isPlaying = true;
-                startTime = audioCtx.currentTime;
-                toggleBtn.textContent = 'STOP';
-                toggleBtn.classList.add('playing');
-                updateStatusDisplay();
-                update();
-            }
+            isPlaying = true;
+            startTime = audioCtx.currentTime;
+            
+            // Hide the hint
+            clickHint.style.display = 'none';
+            
+            // Start the loops
+            animate();
         }
 
-        function stopAudio() {
-            if (isPlaying) {
-                isPlaying = false;
-                toggleBtn.textContent = 'START';
-                toggleBtn.classList.remove('playing');
-                gainNodes.forEach(g => g.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1));
-            }
-        }
+        // Single listener for everything
+        window.addEventListener('click', startEverything);
+        window.addEventListener('touchstart', startEverything);
 
-        // Listen for first interaction to satisfy autoplay policy
-        window.addEventListener('click', () => {
-            if (!isPlaying) startAudio();
-        }, { once: true });
-
-        toggleBtn.addEventListener('click', (e) => {
-            e.stopPropagation(); // Prevent window click from double-triggering
-            if (!isPlaying) startAudio();
-            else stopAudio();
-        });
-
-        // Try to start immediately (might be blocked by browser)
-        window.addEventListener('load', () => {
-            startAudio().catch(() => {
-                console.log('Autoplay blocked, waiting for user interaction.');
-            });
-        });
-    </script>
+        // Initial setup
+        initGrid();
     </script>
 </body>
 </html>
