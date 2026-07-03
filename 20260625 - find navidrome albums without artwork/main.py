@@ -12,9 +12,9 @@ import time
 import tkinter as tk
 import uuid
 import webbrowser
-from math import ceil
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from math import ceil
 from tkinter import messagebox, ttk
 from urllib.parse import quote_plus
 
@@ -124,6 +124,36 @@ def trigger_rescan(album_dir: str) -> None:
 
 class AlbumArtApp:
     PAGE_SIZE = 100
+    SORT_OPTIONS = {
+        "Rating": lambda album: (
+            album.rated_songs,
+            album.total_rating,
+            album.played_songs,
+            album.total_plays,
+            album.artist.lower(),
+            album.album.lower(),
+        ),
+        "Playcount": lambda album: (
+            album.total_plays,
+            album.played_songs,
+            album.rated_songs,
+            album.total_rating,
+            album.artist.lower(),
+            album.album.lower(),
+        ),
+        "Artist": lambda album: (
+            album.artist.lower(),
+            album.album.lower(),
+            -album.rated_songs,
+            -album.played_songs,
+        ),
+        "Album": lambda album: (
+            album.album.lower(),
+            album.artist.lower(),
+            -album.rated_songs,
+            -album.played_songs,
+        ),
+    }
 
     def __init__(self, albums: list[AlbumInfo], music_dir: str):
         self.albums = albums
@@ -138,8 +168,11 @@ class AlbumArtApp:
         self.album_url_vars = [tk.StringVar(master=self.root) for _ in self.albums]
         self.completed_indices: set[int] = set()
         self.url_entries: list[tuple[int, AlbumInfo, tk.Entry]] = []
+        self.sort_var = tk.StringVar(master=self.root, value="Rating")
+        self.sorted_album_indices = list(range(len(self.albums)))
 
         self._build_ui()
+        self._apply_sort(reset_page=False)
 
     def _build_ui(self):
         # Top bar with pagination controls
@@ -154,6 +187,17 @@ class AlbumArtApp:
 
         self.next_button = ttk.Button(top_frame, text="Next \u2192", command=self._next_page)
         self.next_button.pack(side=tk.LEFT)
+
+        ttk.Label(top_frame, text="Sort by:").pack(side=tk.LEFT, padx=(20, 5))
+        self.sort_combo = ttk.Combobox(
+            top_frame,
+            textvariable=self.sort_var,
+            values=list(self.SORT_OPTIONS),
+            state="readonly",
+            width=12,
+        )
+        self.sort_combo.pack(side=tk.LEFT)
+        self.sort_combo.bind("<<ComboboxSelected>>", self._on_sort_changed)
 
         # Main frame with scrollbar
         main_frame = ttk.Frame(self.root)
@@ -186,8 +230,6 @@ class AlbumArtApp:
         self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
         self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
 
-        self._render_page()
-
         # Bottom bar with Go button
         bottom_frame = ttk.Frame(self.root)
         bottom_frame.pack(fill=tk.X, padx=10, pady=10)
@@ -200,21 +242,45 @@ class AlbumArtApp:
         )
         go_button.pack(side=tk.RIGHT)
 
+    def _apply_sort(self, reset_page: bool = True):
+        sort_label = self.sort_var.get()
+        key_func = self.SORT_OPTIONS.get(sort_label, self.SORT_OPTIONS["Rating"])
+        reverse = sort_label in {"Rating", "Playcount"}
+        self.sorted_album_indices = sorted(
+            range(len(self.albums)),
+            key=lambda idx: key_func(self.albums[idx]),
+            reverse=reverse,
+        )
+
+        if reset_page:
+            self.current_page = 0
+
+        self._render_page()
+
+    def _on_sort_changed(self, _event=None):
+        self._apply_sort(reset_page=True)
+
     def _render_page(self):
         for child in self.scrollable_frame.winfo_children():
             child.destroy()
 
         self.url_entries.clear()
         start = self.current_page * self.PAGE_SIZE
-        end = min(start + self.PAGE_SIZE, len(self.albums))
+        end = min(start + self.PAGE_SIZE, len(self.sorted_album_indices))
 
-        for idx in range(start, end):
-            self._add_album_row(idx, self.albums[idx], self.album_url_vars[idx])
+        for display_idx in range(start, end):
+            album_idx = self.sorted_album_indices[display_idx]
+            self._add_album_row(
+                album_idx,
+                display_idx,
+                self.albums[album_idx],
+                self.album_url_vars[album_idx],
+            )
 
         self.page_label.config(
             text=(
                 f"Page {self.current_page + 1}/{self.total_pages} "
-                f"(showing {start + 1}-{end} of {len(self.albums)})"
+                f"(showing {start + 1}-{end} of {len(self.sorted_album_indices)})"
             )
         )
         self.prev_button.config(state="normal" if self.current_page > 0 else "disabled")
@@ -235,7 +301,13 @@ class AlbumArtApp:
         self.current_page += 1
         self._render_page()
 
-    def _add_album_row(self, idx: int, album: AlbumInfo, url_var: tk.StringVar):
+    def _add_album_row(
+        self,
+        album_idx: int,
+        display_idx: int,
+        album: AlbumInfo,
+        url_var: tk.StringVar,
+    ):
         frame = ttk.Frame(self.scrollable_frame)
         frame.pack(fill=tk.X, pady=2, padx=5)
 
@@ -244,7 +316,7 @@ class AlbumArtApp:
         info_frame.pack(fill=tk.X)
 
         label_text = (
-            f"[{idx + 1}] {album.artist} - {album.album}  "
+            f"[{display_idx + 1}] {album.artist} - {album.album}  "
             f"({album.rated_songs} rated, {album.played_songs} played"
         )
         if album.total_rating > 0:
@@ -271,12 +343,12 @@ class AlbumArtApp:
         url_entry = ttk.Entry(entry_frame, textvariable=url_var)
         url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 0))
 
-        if idx in self.completed_indices:
+        if album_idx in self.completed_indices:
             url_entry.config(state="readonly")
         else:
             url_entry.config(state="normal")
 
-        self.url_entries.append((idx, album, url_entry))
+        self.url_entries.append((album_idx, album, url_entry))
 
         # Separator
         ttk.Separator(frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(5, 0))
