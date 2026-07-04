@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import statistics
 import shutil
 import subprocess
 import sys
@@ -79,6 +80,7 @@ class RenderConfig:
     screenshots: int
     columns: int | None
     output_dir: Path
+    image_quality: int
 
 
 class VideoProbeError(RuntimeError):
@@ -120,6 +122,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Replace existing output files.",
     )
+    parser.add_argument(
+        "--quality",
+        type=int,
+        default=62,
+        help="JPEG quality for output images (1-95, lower = smaller files).",
+    )
     return parser.parse_args()
 
 
@@ -145,6 +153,8 @@ def main() -> int:
     args = parse_args()
     if args.screenshots <= 0:
         raise SystemExit("--screenshots must be greater than zero")
+    if not 1 <= args.quality <= 95:
+        raise SystemExit("--quality must be between 1 and 95")
 
     if not args.folder.is_dir():
         raise SystemExit(f"Input folder does not exist: {args.folder}")
@@ -159,6 +169,7 @@ def main() -> int:
         screenshots=args.screenshots,
         columns=args.columns,
         output_dir=args.output_dir or args.folder / "screens",
+        image_quality=args.quality,
     )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -173,10 +184,14 @@ def main() -> int:
         return 1
 
     rendered = 0
+    durations: list[float] = []
     for video_path in videos:
         try:
             metadata = probe_video(video_path)
-            output_path = config.output_dir / f"{video_path.stem}.png"
+            if metadata.duration_seconds and metadata.duration_seconds > 0:
+                durations.append(metadata.duration_seconds)
+
+            output_path = config.output_dir / f"{video_path.stem}.jpg"
             if output_path.exists() and not args.overwrite:
                 print(f"Skipping existing {output_path}")
                 continue
@@ -185,6 +200,16 @@ def main() -> int:
             rendered += 1
         except Exception as exc:  # noqa: BLE001
             print(f"Failed for {video_path}: {exc}", file=sys.stderr)
+
+    summary_path = config.output_dir / "video-length-histogram.jpg"
+    render_duration_histogram(
+        durations_seconds=durations,
+        output_path=summary_path,
+        size=config.size,
+        video_count=len(videos),
+        quality=config.image_quality,
+    )
+    print(f"Wrote {summary_path}")
 
     print(f"Rendered {rendered} sheet(s)")
     return 0
@@ -342,7 +367,7 @@ def render_video_sheet(metadata: VideoMetadata, output_path: Path, config: Rende
                     caption_font=small_font,
                 )
 
-    image.save(output_path)
+    save_compact_jpeg(image, output_path, quality=config.image_quality)
 
 
 def build_layout(canvas_width: int, canvas_height: int, screenshot_count: int, columns: int | None) -> "SheetLayout":
@@ -353,15 +378,15 @@ def build_layout(canvas_width: int, canvas_height: int, screenshot_count: int, c
         columns = max(1, min(columns, screenshot_count))
 
     rows = max(1, math.ceil(screenshot_count / columns))
-    margin = max(16, min(canvas_width, canvas_height) // 40)
-    gap = max(10, min(canvas_width, canvas_height) // 80)
+    margin = max(6, min(canvas_width, canvas_height) // 90)
+    gap = max(4, min(canvas_width, canvas_height) // 140)
 
     available_width = canvas_width - margin * 2 - gap * (columns - 1)
     available_height = canvas_height - margin * 2 - gap * (rows - 1)
 
     tile_width = max(1, available_width // columns)
     tile_height = max(1, available_height // rows)
-    thumb_height = max(1, tile_height - max(22, tile_height // 9))
+    thumb_height = max(1, tile_height - max(16, tile_height // 12))
 
     return SheetLayout(
         columns=columns,
@@ -441,8 +466,8 @@ def draw_header(
     body_font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     small_font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
 ) -> tuple[Image.Image, int]:
-    padding = max(24, width // 72)
-    line_gap = max(6, padding // 4)
+    padding = max(12, width // 128)
+    line_gap = max(3, padding // 4)
 
     lines = build_metadata_lines(metadata)
     title_lines = wrap_text(draw, metadata.path.name, title_font, width - padding * 2)
@@ -456,22 +481,22 @@ def draw_header(
     header = Image.new("RGB", (width, header_height), PANEL)
     header_draw = ImageDraw.Draw(header)
 
-    header_draw.rectangle((0, header_height - 4, width, header_height), fill=PANEL_ALT)
+    header_draw.rectangle((0, header_height - 3, width, header_height), fill=PANEL_ALT)
     header_draw.rectangle((0, 0, width - 1, header_height - 1), outline=BORDER)
-    header_draw.rectangle((padding, padding, padding + 10, header_height - padding), fill=ACCENT)
+    header_draw.rectangle((padding, padding, padding + 7, header_height - padding), fill=ACCENT)
 
     current_y = padding
     for line in title_lines:
-        header_draw.text((padding + 22, current_y), line, font=title_font, fill=TEXT)
+        header_draw.text((padding + 15, current_y), line, font=title_font, fill=TEXT)
         current_y += text_height(header_draw, line, title_font) + line_gap
 
     current_y += line_gap
     for line in body_lines:
-        header_draw.text((padding + 22, current_y), line, font=body_font, fill=SUBTLE)
+        header_draw.text((padding + 15, current_y), line, font=body_font, fill=SUBTLE)
         current_y += text_height(header_draw, line, body_font) + line_gap
 
     footer_text = f"Screenshots: {screenshot_count}"
-    header_draw.text((padding + 22, header_height - padding - font_size(small_font, 13)), footer_text, font=small_font, fill=ACCENT)
+    header_draw.text((padding + 15, header_height - padding - font_size(small_font, 13)), footer_text, font=small_font, fill=ACCENT)
     return header, header_height
 
 
@@ -521,21 +546,132 @@ def draw_thumbnail_tile(
 ) -> None:
     draw = ImageDraw.Draw(image)
     left, top, right, bottom = tile
-    caption_height = max(22, font_size(caption_font, 13) + 10)
+    caption_height = max(16, font_size(caption_font, 13) + 5)
     thumb_box = (left, top, right, bottom - caption_height)
     caption_box = (left, bottom - caption_height, right, bottom)
 
-    draw.rounded_rectangle(tile, radius=10, fill=PANEL, outline=BORDER, width=2)
-    draw.rounded_rectangle((thumb_box[0] + 1, thumb_box[1] + 1, thumb_box[2] - 1, thumb_box[3] - 1), radius=8, fill=(10, 10, 12))
+    draw.rectangle(tile, fill=PANEL, outline=BORDER, width=1)
+    draw.rectangle((thumb_box[0] + 1, thumb_box[1] + 1, thumb_box[2] - 1, thumb_box[3] - 1), fill=(10, 10, 12))
 
-    fitted = ImageOps.contain(frame, (thumb_box[2] - thumb_box[0] - 8, thumb_box[3] - thumb_box[1] - 8))
+    fitted = ImageOps.contain(frame, (thumb_box[2] - thumb_box[0] - 4, thumb_box[3] - thumb_box[1] - 4))
     paste_x = thumb_box[0] + ((thumb_box[2] - thumb_box[0]) - fitted.width) // 2
     paste_y = thumb_box[1] + ((thumb_box[3] - thumb_box[1]) - fitted.height) // 2
     image.paste(fitted, (paste_x, paste_y))
 
     draw.rectangle(caption_box, fill=PANEL_ALT)
     timestamp_text = format_timestamp(timestamp)
-    draw.text((left + 10, bottom - caption_height + 4), timestamp_text, font=caption_font, fill=TEXT)
+    draw.text((left + 5, bottom - caption_height + 2), timestamp_text, font=caption_font, fill=TEXT)
+
+
+def save_compact_jpeg(image: Image.Image, output_path: Path, quality: int) -> None:
+    rgb = image.convert("RGB")
+    rgb.save(
+        output_path,
+        format="JPEG",
+        quality=quality,
+        optimize=True,
+        progressive=True,
+        subsampling=2,
+    )
+
+
+def render_duration_histogram(
+    durations_seconds: list[float],
+    output_path: Path,
+    size: tuple[int, int],
+    video_count: int,
+    quality: int,
+) -> None:
+    width, height = size
+    image = Image.new("RGB", (width, height), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+
+    title_font = load_font(max(26, height // 28), bold=True)
+    body_font = load_font(max(15, height // 62))
+    small_font = load_font(max(13, height // 80))
+
+    pad_x = max(26, width // 22)
+    pad_top = max(26, height // 18)
+    chart_top = pad_top + max(46, font_size(title_font, 28) + 20)
+    chart_bottom = height - max(120, height // 6)
+    chart_left = pad_x
+    chart_right = width - pad_x
+    chart_width = chart_right - chart_left
+    chart_height = max(10, chart_bottom - chart_top)
+
+    draw.rectangle((0, 0, width - 1, height - 1), outline=BORDER)
+    draw.text((pad_x, pad_top), "Video Length Distribution", font=title_font, fill=TEXT)
+
+    if not durations_seconds:
+        message = f"No valid durations found across {video_count} videos"
+        draw.text((pad_x, chart_top + 10), message, font=body_font, fill=SUBTLE)
+        save_compact_jpeg(image, output_path, quality=quality)
+        return
+
+    sorted_durations = sorted(durations_seconds)
+    bins = min(24, max(6, int(round(math.sqrt(len(sorted_durations))))))
+    max_duration = max(sorted_durations)
+    min_duration = min(sorted_durations)
+    if max_duration <= 0:
+        max_duration = 1.0
+
+    bin_width = max_duration / bins
+    counts = [0] * bins
+    for value in sorted_durations:
+        index = min(bins - 1, int(value / bin_width))
+        counts[index] += 1
+
+    max_count = max(counts) or 1
+    axis_color = (120, 126, 140)
+
+    draw.line((chart_left, chart_top, chart_left, chart_bottom), fill=axis_color, width=2)
+    draw.line((chart_left, chart_bottom, chart_right, chart_bottom), fill=axis_color, width=2)
+
+    bar_gap = max(1, chart_width // (bins * 7))
+    bar_width = max(1, (chart_width - bar_gap * (bins - 1)) // bins)
+    total_bar_width = bins * bar_width + (bins - 1) * bar_gap
+    start_x = chart_left + (chart_width - total_bar_width) // 2
+
+    for idx, count in enumerate(counts):
+        left = start_x + idx * (bar_width + bar_gap)
+        bar_height = int((count / max_count) * (chart_height - 8))
+        top = chart_bottom - bar_height
+        fill = ACCENT if idx % 2 == 0 else (84, 143, 223)
+        draw.rectangle((left, top, left + bar_width, chart_bottom - 1), fill=fill)
+
+    max_minutes = max_duration / 60
+    x_labels = [
+        (chart_left, "0m"),
+        (chart_left + chart_width // 2, f"{max_minutes / 2:.1f}m"),
+        (chart_right, f"{max_minutes:.1f}m"),
+    ]
+    for x, label in x_labels:
+        text_box = draw.textbbox((0, 0), label, font=small_font)
+        label_width = text_box[2] - text_box[0]
+        draw.text((x - label_width // 2, chart_bottom + 8), label, font=small_font, fill=SUBTLE)
+
+    y_labels = [0, max(1, max_count // 2), max_count]
+    for y_value in y_labels:
+        ratio = y_value / max_count
+        y = chart_bottom - int(ratio * (chart_height - 8))
+        label = str(y_value)
+        text_box = draw.textbbox((0, 0), label, font=small_font)
+        label_w = text_box[2] - text_box[0]
+        label_h = text_box[3] - text_box[1]
+        draw.text((chart_left - label_w - 10, y - label_h // 2), label, font=small_font, fill=SUBTLE)
+
+    avg_duration = statistics.fmean(sorted_durations)
+    median_duration = statistics.median(sorted_durations)
+    stats = (
+        f"Videos: {len(sorted_durations)}/{video_count} with duration  |  "
+        f"Min: {format_duration(min_duration)}  |  "
+        f"Median: {format_duration(float(median_duration))}  |  "
+        f"Avg: {format_duration(avg_duration)}  |  "
+        f"Max: {format_duration(max_duration)}"
+    )
+    draw.text((pad_x, height - max(62, height // 12)), stats, font=body_font, fill=SUBTLE)
+
+    save_compact_jpeg(image, output_path, quality=quality)
 
 
 def measure_block(
