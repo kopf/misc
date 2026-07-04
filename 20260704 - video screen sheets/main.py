@@ -633,6 +633,8 @@ def render_duration_histogram(
     start_x = chart_left + (chart_width - total_bar_width) // 2
 
     for idx, count in enumerate(counts):
+        if count <= 0:
+            continue
         left = start_x + idx * (bar_width + bar_gap)
         bar_height = int((count / max_count) * (chart_height - 8))
         top = chart_bottom - bar_height
