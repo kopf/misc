@@ -632,14 +632,19 @@ def render_duration_histogram(
     total_bar_width = bins * bar_width + (bins - 1) * bar_gap
     start_x = chart_left + (chart_width - total_bar_width) // 2
 
+    bin_labels: list[tuple[int, str]] = []
     for idx, count in enumerate(counts):
-        if count <= 0:
-            continue
         left = start_x + idx * (bar_width + bar_gap)
-        bar_height = max(1, int((count / max_count) * (chart_height - 8)))
+        bar_height = max(1, int((count / max_count) * (chart_height - 8))) if count > 0 else 1
         top = chart_bottom - bar_height
         fill = ACCENT if idx % 2 == 0 else (84, 143, 223)
-        draw.rectangle((left, top, left + bar_width, chart_bottom - 1), fill=fill)
+        if count > 0:
+            draw.rectangle((left, top, left + bar_width, chart_bottom - 1), fill=fill)
+
+        bin_start = idx * bin_width
+        bin_end = max_duration if idx == bins - 1 else (idx + 1) * bin_width
+        bin_label = f"{format_duration_whole(bin_start)}-{format_duration_whole(bin_end)}"
+        bin_labels.append((left + bar_width // 2, bin_label))
 
     max_minutes = max_duration / 60
     x_labels = [
@@ -651,6 +656,16 @@ def render_duration_histogram(
         text_box = draw.textbbox((0, 0), label, font=small_font)
         label_width = text_box[2] - text_box[0]
         draw.text((x - label_width // 2, chart_bottom + 8), label, font=small_font, fill=SUBTLE)
+
+    caption_font = load_font(max(10, height // 110))
+    caption_row_gap = max(2, font_size(caption_font, 10) + 2)
+    caption_y = chart_bottom + 30
+    for idx, (x_center, label) in enumerate(bin_labels):
+        text_box = draw.textbbox((0, 0), label, font=caption_font)
+        label_width = text_box[2] - text_box[0]
+        label_x = x_center - label_width // 2
+        label_y = caption_y + (idx % 2) * caption_row_gap
+        draw.text((label_x, label_y), label, font=caption_font, fill=SUBTLE)
 
     y_labels = [0, max(1, max_count // 2), max_count]
     for y_value in y_labels:
@@ -751,6 +766,15 @@ def format_timestamp(seconds: float) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}.{tenths:d}"
     return f"{minutes:02d}:{secs:02d}.{tenths:d}"
+
+
+def format_duration_whole(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:d}:{secs:02d}"
 
 
 def format_file_size(size: int) -> str:
