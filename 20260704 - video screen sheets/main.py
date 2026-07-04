@@ -103,7 +103,7 @@ def parse_args() -> argparse.Namespace:
         "-n",
         "--screenshots",
         type=int,
-        default=16,
+        default=18,
         help="Number of screenshots to sample per video.",
     )
     parser.add_argument(
