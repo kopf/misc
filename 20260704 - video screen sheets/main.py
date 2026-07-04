@@ -636,7 +636,7 @@ def render_duration_histogram(
         if count <= 0:
             continue
         left = start_x + idx * (bar_width + bar_gap)
-        bar_height = int((count / max_count) * (chart_height - 8))
+        bar_height = max(1, int((count / max_count) * (chart_height - 8)))
         top = chart_bottom - bar_height
         fill = ACCENT if idx % 2 == 0 else (84, 143, 223)
         draw.rectangle((left, top, left + bar_width, chart_bottom - 1), fill=fill)
