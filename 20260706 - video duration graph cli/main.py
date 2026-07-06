@@ -3,6 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #   "matplotlib",
+#   "tqdm",
 # ]
 # ///
 
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Sequence
 
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 VIDEO_EXTENSIONS = {
     ".mp4",
@@ -135,13 +137,23 @@ def normalize_extensions(raw_extensions: str) -> set[str]:
 def discover_video_files(root: Path, extensions: set[str], recursive: bool) -> list[Path]:
     files: list[Path] = []
     if recursive:
-        for candidate in root.rglob("*"):
+        for candidate in tqdm(
+            root.rglob("*"),
+            desc="Scanning files",
+            unit="entry",
+        ):
             if not candidate.is_file() or candidate.name.startswith("."):
                 continue
             if candidate.suffix.lower() in extensions:
                 files.append(candidate)
     else:
-        for candidate in root.iterdir():
+        top_level_entries = list(root.iterdir())
+        for candidate in tqdm(
+            top_level_entries,
+            desc="Scanning files",
+            total=len(top_level_entries),
+            unit="entry",
+        ):
             if not candidate.is_file() or candidate.name.startswith("."):
                 continue
             if candidate.suffix.lower() in extensions:
@@ -344,7 +356,7 @@ def main() -> int:
     parsed: list[VideoDuration] = []
     skipped: list[tuple[Path, str]] = []
 
-    for video_file in discovered:
+    for video_file in tqdm(discovered, desc="Probing durations", unit="video"):
         try:
             duration = probe_duration_seconds(video_file)
             parsed.append(VideoDuration(path=video_file, seconds=duration))
