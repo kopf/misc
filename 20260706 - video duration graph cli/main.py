@@ -85,9 +85,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--chart",
-        choices=["histogram", "pie"],
-        default="histogram",
-        help="Chart type to generate (default: histogram).",
+        choices=["histogram", "pie", "both"],
+        default="both",
+        help="Chart type to generate (default: both).",
     )
     parser.add_argument(
         "--output",
@@ -285,7 +285,7 @@ def default_output_path(chart: str) -> Path:
 def print_summary(
     videos: Sequence[VideoDuration],
     skipped: Sequence[tuple[Path, str]],
-    output_path: Path,
+    output_paths: Sequence[Path],
     scanned_count: int,
 ) -> None:
     values = [entry.seconds for entry in videos]
@@ -296,7 +296,12 @@ def print_summary(
     print(f"Min duration: {format_duration(min(values))}")
     print(f"Median duration: {format_duration(statistics.median(values))}")
     print(f"Max duration: {format_duration(max(values))}")
-    print(f"Output graph: {output_path}")
+    if len(output_paths) == 1:
+        print(f"Output graph: {output_paths[0]}")
+    else:
+        print("Output graphs:")
+        for path in output_paths:
+            print(f"- {path}")
 
     if skipped:
         print("\nSkipped file details:")
@@ -352,18 +357,47 @@ def main() -> int:
 
     buckets = build_buckets([item.seconds for item in parsed])
 
-    output_path = (
-        args.output.expanduser().resolve() if args.output is not None else default_output_path(args.chart)
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.chart == "both" and args.output is not None:
+        print(
+            "Error: --output cannot be used with --chart both. "
+            "Use default filenames or run with a single chart type.",
+            file=sys.stderr,
+        )
+        return 1
+
+    output_paths: list[Path] = []
+    if args.chart == "both":
+        histogram_output = default_output_path("histogram")
+        pie_output = default_output_path("pie")
+        output_paths.extend([histogram_output, pie_output])
+    else:
+        single_output = (
+            args.output.expanduser().resolve()
+            if args.output is not None
+            else default_output_path(args.chart)
+        )
+        output_paths.append(single_output)
+
+    for output_path in output_paths:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
     title = f"Video Duration Distribution ({len(parsed)} videos)"
-    if args.chart == "histogram":
-        plot_histogram(buckets, output_path=output_path, title=title)
-    else:
-        plot_pie_chart(buckets, output_path=output_path, title=title)
+    if args.chart in {"histogram", "both"}:
+        histogram_output = (
+            output_paths[0] if args.chart == "histogram" else default_output_path("histogram")
+        )
+        plot_histogram(buckets, output_path=histogram_output, title=title)
 
-    print_summary(parsed, skipped=skipped, output_path=output_path, scanned_count=len(discovered))
+    if args.chart in {"pie", "both"}:
+        pie_output = output_paths[0] if args.chart == "pie" else default_output_path("pie")
+        plot_pie_chart(buckets, output_path=pie_output, title=title)
+
+    print_summary(
+        parsed,
+        skipped=skipped,
+        output_paths=output_paths,
+        scanned_count=len(discovered),
+    )
     return 0
 
 
