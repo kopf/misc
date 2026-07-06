@@ -42,3 +42,8 @@ This repository contains a collection of self-contained, once-off Python scripts
 2. **Directory Creation:** Create `YYYYMMDD - name/`.
 3. **Implementation:** Write `main.py` (or a descriptive name) with the `uv` hashbang and required dependencies.
 4. **Git Ignore:** Add `.gitignore` for any anticipated output files.
+
+## Library preferences
+
+* Use `click` for defining CLI interfaces.
+* When a large number of items will be iterated over, always display a progress bar. Use whatever library (e.g. `tqdm` in the console) suits best. 
