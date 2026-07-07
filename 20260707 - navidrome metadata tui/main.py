@@ -43,6 +43,8 @@ SortField = Literal["id", "artist", "album", "title", "rating", "play_count"]
 DEFAULT_LIMIT = 500
 MIN_WIDTH = 120
 MIN_HEIGHT = 36
+TRACK_ITEM_TYPE_CANDIDATES: tuple[str, ...] = ("track", "media_file", "song")
+DEFAULT_PAGE_SIZE = 200
 
 COLUMN_DEFS: list[tuple[str, str, int]] = [
     ("id", "ID", 16),
@@ -106,6 +108,24 @@ class NavidromeRepository:
         self._conn = sqlite3.connect(str(db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
+        self.track_item_type = self._detect_track_item_type()
+
+    def _detect_track_item_type(self) -> str:
+        placeholders = ",".join("?" for _ in TRACK_ITEM_TYPE_CANDIDATES)
+        row = self._conn.execute(
+            f"""
+            SELECT item_type, COUNT(*) AS n
+            FROM annotation
+            WHERE item_type IN ({placeholders})
+            GROUP BY item_type
+            ORDER BY n DESC
+            LIMIT 1
+            """,
+            TRACK_ITEM_TYPE_CANDIDATES,
+        ).fetchone()
+        if not row:
+            return "track"
+        return str(row["item_type"])
 
     def close(self) -> None:
         self._conn.close()
@@ -151,10 +171,11 @@ class NavidromeRepository:
         sort_field: SortField = "artist",
         sort_desc: bool = False,
         limit: int = DEFAULT_LIMIT,
-    ) -> list[TrackRow]:
+        offset: int = 0,
+    ) -> tuple[list[TrackRow], int]:
         like = f"%{term.strip()}%"
         scope_sql: str
-        params: list[object] = [user_id]
+        params: list[object] = []
 
         if scope == "artist":
             scope_sql = """
@@ -186,27 +207,62 @@ class NavidromeRepository:
             """
             params.extend([like, like, like, like])
 
+        rating_expr = "COALESCE(NULLIF(ann.rating, 0), CAST(ROUND(mf.average_rating) AS INTEGER), 0)"
+
         order_map: dict[SortField, str] = {
             "id": "mf.id",
             "artist": "mf.order_artist_name",
             "album": "mf.order_album_name",
             "title": "COALESCE(NULLIF(mf.sort_title, ''), mf.order_title)",
-            "rating": "COALESCE(ann.rating, 0)",
+            "rating": rating_expr,
             "play_count": "COALESCE(ann.play_count, 0)",
         }
         resolved_sort = order_map.get(sort_field, order_map["artist"])
         direction = "DESC" if sort_desc else "ASC"
 
-        params.append(limit)
+        item_type_placeholders = ",".join("?" for _ in TRACK_ITEM_TYPE_CANDIDATES)
+        ann_params: list[object] = [user_id, *TRACK_ITEM_TYPE_CANDIDATES]
+        count_row = self._conn.execute(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM media_file mf
+            WHERE mf.missing = FALSE
+              AND {scope_sql}
+            """,
+            params,
+        ).fetchone()
+        total = int(count_row["total"] if count_row else 0)
+
+        query_params = [*ann_params, *params, limit, offset]
 
         rows = self._conn.execute(
             f"""
+            WITH ranked_annotation AS (
+                SELECT
+                    item_id,
+                    play_count,
+                    rating,
+                    play_date,
+                    rated_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY item_id
+                        ORDER BY CASE item_type
+                            WHEN 'track' THEN 0
+                            WHEN 'media_file' THEN 1
+                            WHEN 'song' THEN 2
+                            ELSE 100
+                        END
+                    ) AS rn
+                FROM annotation
+                WHERE user_id = ?
+                  AND item_type IN ({item_type_placeholders})
+            )
             SELECT
                 mf.id,
                 mf.artist,
                 mf.album,
                 mf.title,
-                COALESCE(ann.rating, 0) AS rating,
+                {rating_expr} AS rating,
                 COALESCE(ann.play_count, 0) AS play_count,
                 ann.play_date,
                 ann.rated_at,
@@ -217,10 +273,9 @@ class NavidromeRepository:
                 mf.path,
                 mf.album_id
             FROM media_file mf
-            LEFT JOIN annotation ann
-                ON ann.item_id = mf.id
-               AND ann.item_type = 'track'
-               AND ann.user_id = ?
+                        LEFT JOIN ranked_annotation ann
+                                ON ann.item_id = mf.id
+                             AND ann.rn = 1
             WHERE mf.missing = FALSE
               AND {scope_sql}
             ORDER BY {resolved_sort} {direction},
@@ -229,11 +284,12 @@ class NavidromeRepository:
                      mf.disc_number,
                      mf.track_number
             LIMIT ?
+            OFFSET ?
             """,
-            params,
+            query_params,
         ).fetchall()
 
-        return [
+        return ([
             TrackRow(
                 id=row["id"],
                 artist=row["artist"] or "",
@@ -251,11 +307,32 @@ class NavidromeRepository:
                 album_id=row["album_id"] or "",
             )
             for row in rows
-        ]
+        ], total)
 
     def get_track(self, user_id: str, track_id: str) -> TrackRow | None:
+        item_type_placeholders = ",".join("?" for _ in TRACK_ITEM_TYPE_CANDIDATES)
         row = self._conn.execute(
-            """
+            f"""
+            WITH ranked_annotation AS (
+                SELECT
+                    item_id,
+                    play_count,
+                    rating,
+                    play_date,
+                    rated_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY item_id
+                        ORDER BY CASE item_type
+                            WHEN 'track' THEN 0
+                            WHEN 'media_file' THEN 1
+                            WHEN 'song' THEN 2
+                            ELSE 100
+                        END
+                    ) AS rn
+                FROM annotation
+                WHERE user_id = ?
+                  AND item_type IN ({item_type_placeholders})
+            )
             SELECT
                 mf.id,
                 mf.artist,
@@ -272,14 +349,13 @@ class NavidromeRepository:
                 mf.path,
                 mf.album_id
             FROM media_file mf
-            LEFT JOIN annotation ann
+            LEFT JOIN ranked_annotation ann
                 ON ann.item_id = mf.id
-               AND ann.item_type = 'track'
-               AND ann.user_id = ?
+               AND ann.rn = 1
             WHERE mf.id = ?
             LIMIT 1
             """,
-            (user_id, track_id),
+            (user_id, *TRACK_ITEM_TYPE_CANDIDATES, track_id),
         ).fetchone()
         if not row:
             return None
@@ -322,22 +398,11 @@ class NavidromeRepository:
         if not source_track or not target_track:
             raise ValueError("Source or target track does not exist")
 
-        source_ann = self._conn.execute(
-            """
-            SELECT play_count, rating, play_date, rated_at
-            FROM annotation
-            WHERE user_id = ? AND item_id = ? AND item_type = 'track'
-            """,
-            (user_id, source_track_id),
-        ).fetchone()
-        target_ann = self._conn.execute(
-            """
-            SELECT play_count, rating, play_date, rated_at
-            FROM annotation
-            WHERE user_id = ? AND item_id = ? AND item_type = 'track'
-            """,
-            (user_id, target_track_id),
-        ).fetchone()
+        source_ann = self._get_track_annotation(user_id, source_track_id)
+        target_ann = self._get_track_annotation(user_id, target_track_id)
+
+        source_item_type = str(source_ann["item_type"]) if source_ann else self.track_item_type
+        target_item_type = str(target_ann["item_type"]) if target_ann else self.track_item_type
 
         source_play_count = int(source_ann["play_count"] if source_ann else 0)
         source_rating = int(source_ann["rating"] if source_ann else 0)
@@ -376,6 +441,7 @@ class NavidromeRepository:
             self._upsert_track_annotation(
                 user_id=user_id,
                 track_id=source_track_id,
+                item_type=source_item_type,
                 play_count=new_source_play_count,
                 rating=new_source_rating,
                 play_date=dt_to_db(new_source_play_date),
@@ -384,6 +450,7 @@ class NavidromeRepository:
             self._upsert_track_annotation(
                 user_id=user_id,
                 track_id=target_track_id,
+                item_type=target_item_type,
                 play_count=new_target_play_count,
                 rating=new_target_rating,
                 play_date=dt_to_db(new_target_play_date),
@@ -397,10 +464,32 @@ class NavidromeRepository:
                 for album_id in affected_album_ids:
                     self._recompute_album_annotation(user_id=user_id, album_id=album_id)
 
+    def _get_track_annotation(self, user_id: str, track_id: str) -> sqlite3.Row | None:
+        placeholders = ",".join("?" for _ in TRACK_ITEM_TYPE_CANDIDATES)
+        params: list[object] = [user_id, track_id, *TRACK_ITEM_TYPE_CANDIDATES]
+        return self._conn.execute(
+            f"""
+            SELECT item_type, play_count, rating, play_date, rated_at
+            FROM annotation
+            WHERE user_id = ?
+              AND item_id = ?
+              AND item_type IN ({placeholders})
+            ORDER BY CASE item_type
+                WHEN 'track' THEN 0
+                WHEN 'media_file' THEN 1
+                WHEN 'song' THEN 2
+                ELSE 100
+            END
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+
     def _upsert_track_annotation(
         self,
         user_id: str,
         track_id: str,
+        item_type: str,
         play_count: int,
         rating: int,
         play_date: str | None,
@@ -409,31 +498,49 @@ class NavidromeRepository:
         self._conn.execute(
             """
             INSERT INTO annotation (user_id, item_id, item_type, play_count, rating, play_date, rated_at)
-            VALUES (?, ?, 'track', ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, item_id, item_type) DO UPDATE SET
                 play_count = excluded.play_count,
                 rating = excluded.rating,
                 play_date = excluded.play_date,
                 rated_at = excluded.rated_at
             """,
-            (user_id, track_id, play_count, rating, play_date, rated_at),
+            (user_id, track_id, item_type, play_count, rating, play_date, rated_at),
         )
 
     def _recompute_album_annotation(self, user_id: str, album_id: str) -> None:
+        item_type_placeholders = ",".join("?" for _ in TRACK_ITEM_TYPE_CANDIDATES)
         aggregate = self._conn.execute(
-            """
+            f"""
+            WITH ranked_annotation AS (
+                SELECT
+                    item_id,
+                    play_count,
+                    play_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY item_id
+                        ORDER BY CASE item_type
+                            WHEN 'track' THEN 0
+                            WHEN 'media_file' THEN 1
+                            WHEN 'song' THEN 2
+                            ELSE 100
+                        END
+                    ) AS rn
+                FROM annotation
+                WHERE user_id = ?
+                  AND item_type IN ({item_type_placeholders})
+            )
             SELECT
                 COALESCE(SUM(COALESCE(ann.play_count, 0)), 0) AS album_play_count,
                 MAX(ann.play_date) AS album_last_played
             FROM media_file mf
-            LEFT JOIN annotation ann
+            LEFT JOIN ranked_annotation ann
                 ON ann.item_id = mf.id
-               AND ann.item_type = 'track'
-               AND ann.user_id = ?
+               AND ann.rn = 1
             WHERE mf.album_id = ?
               AND mf.missing = FALSE
             """,
-            (user_id, album_id),
+            (user_id, *TRACK_ITEM_TYPE_CANDIDATES, album_id),
         ).fetchone()
 
         play_count = int(aggregate["album_play_count"] or 0)
@@ -661,7 +768,13 @@ class TargetPickerScreen(ModalScreen[str | None]):
     def _refresh_tracks(self) -> None:
         table = self.query_one("#target-table", DataTable)
         search_term = self.query_one("#target-search", Input).value
-        rows = self.repo.search_tracks(self.user_id, search_term, self.search_scope, limit=DEFAULT_LIMIT)
+        rows, _ = self.repo.search_tracks(
+            self.user_id,
+            search_term,
+            self.search_scope,
+            limit=DEFAULT_LIMIT,
+            offset=0,
+        )
         table.clear()
         self.selected_track_id = None
 
@@ -783,6 +896,8 @@ class NavidromeMetadataApp(App[None]):
     BINDINGS = [
         Binding("m", "open_transfer_menu", "Actions"),
         Binding("ctrl+m", "open_transfer_menu", "Actions"),
+        Binding("n", "next_page", "Next Page"),
+        Binding("p", "prev_page", "Prev Page"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -795,6 +910,9 @@ class NavidromeMetadataApp(App[None]):
         self.search_scope: SearchScope = "all"
         self.sort_field: SortField = "artist"
         self.sort_desc = False
+        self.page_index = 0
+        self.page_size = DEFAULT_PAGE_SIZE
+        self.total_results = 0
         self.selected_track_id: str | None = None
         self._search_timer: Timer | None = None
 
@@ -886,6 +1004,7 @@ class NavidromeMetadataApp(App[None]):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "search-input":
+            self.page_index = 0
             self._schedule_refresh()
 
     def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
@@ -898,6 +1017,7 @@ class NavidromeMetadataApp(App[None]):
             self.search_scope = "track"
         else:
             self.search_scope = "all"
+        self.page_index = 0
         self._refresh_tracks()
 
     def _refresh_tracks(self) -> None:
@@ -905,13 +1025,32 @@ class NavidromeMetadataApp(App[None]):
             return
 
         search_term = self.query_one("#search-input", Input).value
-        rows = self.repo.search_tracks(
+        offset = self.page_index * self.page_size
+        rows, total = self.repo.search_tracks(
             self.user_id,
             search_term,
             self.search_scope,
             sort_field=self.sort_field,
             sort_desc=self.sort_desc,
+            limit=self.page_size,
+            offset=offset,
         )
+
+        max_page_index = max(0, (total - 1) // self.page_size) if total else 0
+        if self.page_index > max_page_index:
+            self.page_index = max_page_index
+            offset = self.page_index * self.page_size
+            rows, total = self.repo.search_tracks(
+                self.user_id,
+                search_term,
+                self.search_scope,
+                sort_field=self.sort_field,
+                sort_desc=self.sort_desc,
+                limit=self.page_size,
+                offset=offset,
+            )
+
+        self.total_results = total
         table = self.query_one("#results-table", DataTable)
         table.clear()
 
@@ -929,14 +1068,16 @@ class NavidromeMetadataApp(App[None]):
         if rows:
             self.selected_track_id = rows[0].id
             self._show_track_details(rows[0])
+            total_pages = max(1, (total + self.page_size - 1) // self.page_size)
+            current_page = self.page_index + 1
             self._set_status(
-                f"User: {self.user_name} | {len(rows)} result(s) | Scope: {self.search_scope} | Sort: {self.sort_field} {'desc' if self.sort_desc else 'asc'}"
+                f"User: {self.user_name} | Results: {total} | Page: {current_page}/{total_pages} | Scope: {self.search_scope} | Sort: {self.sort_field} {'desc' if self.sort_desc else 'asc'}"
             )
         else:
             self.selected_track_id = None
             self.query_one("#detail-pane", Static).update("No results")
             self._set_status(
-                f"User: {self.user_name} | 0 result(s) | Scope: {self.search_scope} | Sort: {self.sort_field} {'desc' if self.sort_desc else 'asc'}"
+                f"User: {self.user_name} | Results: 0 | Page: 1/1 | Scope: {self.search_scope} | Sort: {self.sort_field} {'desc' if self.sort_desc else 'asc'}"
             )
 
     def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
@@ -964,6 +1105,22 @@ class NavidromeMetadataApp(App[None]):
             self.sort_field = next_field
             self.sort_desc = False
 
+        self.page_index = 0
+        self._refresh_tracks()
+
+    def action_next_page(self) -> None:
+        if self.total_results <= 0:
+            return
+        max_page_index = max(0, (self.total_results - 1) // self.page_size)
+        if self.page_index >= max_page_index:
+            return
+        self.page_index += 1
+        self._refresh_tracks()
+
+    def action_prev_page(self) -> None:
+        if self.page_index <= 0:
+            return
+        self.page_index -= 1
         self._refresh_tracks()
 
     def _show_track_details(self, track: TrackRow) -> None:
