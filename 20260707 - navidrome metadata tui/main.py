@@ -38,6 +38,7 @@ from textual.widgets import (
 
 SearchScope = Literal["all", "artist", "album", "track"]
 TransferMode = Literal["playcount", "rating", "playcount_and_rating"]
+SortField = Literal["id", "artist", "album", "title", "rating", "play_count"]
 
 DEFAULT_LIMIT = 500
 MIN_WIDTH = 120
@@ -147,6 +148,8 @@ class NavidromeRepository:
         user_id: str,
         term: str,
         scope: SearchScope,
+        sort_field: SortField = "artist",
+        sort_desc: bool = False,
         limit: int = DEFAULT_LIMIT,
     ) -> list[TrackRow]:
         like = f"%{term.strip()}%"
@@ -183,6 +186,17 @@ class NavidromeRepository:
             """
             params.extend([like, like, like, like])
 
+        order_map: dict[SortField, str] = {
+            "id": "mf.id",
+            "artist": "mf.order_artist_name",
+            "album": "mf.order_album_name",
+            "title": "COALESCE(NULLIF(mf.sort_title, ''), mf.order_title)",
+            "rating": "COALESCE(ann.rating, 0)",
+            "play_count": "COALESCE(ann.play_count, 0)",
+        }
+        resolved_sort = order_map.get(sort_field, order_map["artist"])
+        direction = "DESC" if sort_desc else "ASC"
+
         params.append(limit)
 
         rows = self._conn.execute(
@@ -209,7 +223,11 @@ class NavidromeRepository:
                AND ann.user_id = ?
             WHERE mf.missing = FALSE
               AND {scope_sql}
-            ORDER BY mf.order_artist_name, mf.order_album_name, mf.disc_number, mf.track_number
+            ORDER BY {resolved_sort} {direction},
+                     mf.order_artist_name,
+                     mf.order_album_name,
+                     mf.disc_number,
+                     mf.track_number
             LIMIT ?
             """,
             params,
@@ -575,9 +593,14 @@ class TargetPickerScreen(ModalScreen[str | None]):
     }
 
     #target-scopes {
+        layout: horizontal;
         height: auto;
         margin-top: 1;
         margin-bottom: 1;
+    }
+
+    #target-scopes RadioButton {
+        margin-right: 2;
     }
 
     #target-table {
@@ -732,8 +755,13 @@ class NavidromeMetadataApp(App[None]):
     }
 
     #scopes {
+        layout: horizontal;
         height: auto;
         margin-top: 1;
+    }
+
+    #scopes RadioButton {
+        margin-right: 2;
     }
 
     #results-pane {
@@ -765,6 +793,8 @@ class NavidromeMetadataApp(App[None]):
         self.user_id: str | None = None
         self.user_name: str | None = None
         self.search_scope: SearchScope = "all"
+        self.sort_field: SortField = "artist"
+        self.sort_desc = False
         self.selected_track_id: str | None = None
         self._search_timer: Timer | None = None
 
@@ -792,8 +822,8 @@ class NavidromeMetadataApp(App[None]):
         self.repo.validate_schema()
         table = self.query_one("#results-table", DataTable)
         table.cursor_type = "row"
-        for _, label, width in COLUMN_DEFS:
-            table.add_column(label, width=width)
+        for key, label, width in COLUMN_DEFS:
+            table.add_column(label, key=key, width=width)
 
         self._update_layout_visibility()
         self._pick_user_then_load()
@@ -875,7 +905,13 @@ class NavidromeMetadataApp(App[None]):
             return
 
         search_term = self.query_one("#search-input", Input).value
-        rows = self.repo.search_tracks(self.user_id, search_term, self.search_scope)
+        rows = self.repo.search_tracks(
+            self.user_id,
+            search_term,
+            self.search_scope,
+            sort_field=self.sort_field,
+            sort_desc=self.sort_desc,
+        )
         table = self.query_one("#results-table", DataTable)
         table.clear()
 
@@ -894,12 +930,41 @@ class NavidromeMetadataApp(App[None]):
             self.selected_track_id = rows[0].id
             self._show_track_details(rows[0])
             self._set_status(
-                f"User: {self.user_name} | {len(rows)} result(s) | Scope: {self.search_scope}"
+                f"User: {self.user_name} | {len(rows)} result(s) | Scope: {self.search_scope} | Sort: {self.sort_field} {'desc' if self.sort_desc else 'asc'}"
             )
         else:
             self.selected_track_id = None
             self.query_one("#detail-pane", Static).update("No results")
-            self._set_status(f"User: {self.user_name} | 0 result(s) | Scope: {self.search_scope}")
+            self._set_status(
+                f"User: {self.user_name} | 0 result(s) | Scope: {self.search_scope} | Sort: {self.sort_field} {'desc' if self.sort_desc else 'asc'}"
+            )
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        if event.data_table.id != "results-table":
+            return
+
+        clicked_key_obj = getattr(event, "column_key", None)
+        clicked_key: str | None
+        if clicked_key_obj is not None:
+            clicked_key = str(getattr(clicked_key_obj, "value", clicked_key_obj))
+        else:
+            column_index = getattr(event, "column_index", None)
+            if column_index is None or not (0 <= column_index < len(COLUMN_DEFS)):
+                return
+            clicked_key = COLUMN_DEFS[column_index][0]
+
+        valid_fields = {key for key, _, _ in COLUMN_DEFS}
+        if clicked_key not in valid_fields:
+            return
+
+        next_field = clicked_key
+        if next_field == self.sort_field:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_field = next_field
+            self.sort_desc = False
+
+        self._refresh_tracks()
 
     def _show_track_details(self, track: TrackRow) -> None:
         detail = (
