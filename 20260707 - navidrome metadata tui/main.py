@@ -828,6 +828,11 @@ class TargetPickerScreen(ModalScreen[str | None]):
             return
         self.selected_track_id = str(event.row_key.value)
 
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "target-table":
+            return
+        self.selected_track_id = str(event.row_key.value)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "target-transfer":
             self.dismiss(self.selected_track_id)
