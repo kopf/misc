@@ -611,6 +611,9 @@ class UserSelectScreen(ModalScreen[str | None]):
                 yield Button("Cancel", id="cancel")
                 yield Button("Use Selected User", id="confirm", variant="primary")
 
+    def on_mount(self) -> None:
+        self.query_one("#user-list", ListView).focus()
+
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item_id = event.item.id
         if not item_id:
@@ -1139,6 +1142,16 @@ class NavidromeMetadataApp(App[None]):
             f"Path: {track.path}"
         )
         self.query_one("#detail-pane", Static).update(detail)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "results-table" or not self.user_id:
+            return
+
+        selected_id = str(event.row_key.value)
+        self.selected_track_id = selected_id
+        track = self.repo.get_track(self.user_id, selected_id)
+        if track:
+            self._show_track_details(track)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "results-table" or not self.user_id:
