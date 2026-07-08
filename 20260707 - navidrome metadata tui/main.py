@@ -173,39 +173,47 @@ class NavidromeRepository:
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
     ) -> tuple[list[TrackRow], int]:
-        like = f"%{term.strip()}%"
-        scope_sql: str
-        params: list[object] = []
+        terms = [part for part in term.strip().split() if part]
+        if not terms:
+            terms = [""]
 
+        scope_fields: list[str]
         if scope == "artist":
-            scope_sql = """
-            (mf.artist LIKE ? COLLATE NOCASE
-            OR mf.order_artist_name LIKE ? COLLATE NOCASE
-            OR mf.sort_artist_name LIKE ? COLLATE NOCASE)
-            """
-            params.extend([like, like, like])
+            scope_fields = [
+                "mf.artist",
+                "mf.order_artist_name",
+                "mf.sort_artist_name",
+            ]
         elif scope == "album":
-            scope_sql = """
-            (mf.album LIKE ? COLLATE NOCASE
-            OR mf.order_album_name LIKE ? COLLATE NOCASE
-            OR mf.sort_album_name LIKE ? COLLATE NOCASE)
-            """
-            params.extend([like, like, like])
+            scope_fields = [
+                "mf.album",
+                "mf.order_album_name",
+                "mf.sort_album_name",
+            ]
         elif scope == "track":
-            scope_sql = """
-            (mf.title LIKE ? COLLATE NOCASE
-            OR mf.order_title LIKE ? COLLATE NOCASE
-            OR mf.sort_title LIKE ? COLLATE NOCASE)
-            """
-            params.extend([like, like, like])
+            scope_fields = [
+                "mf.title",
+                "mf.order_title",
+                "mf.sort_title",
+            ]
         else:
-            scope_sql = """
-            (mf.artist LIKE ? COLLATE NOCASE
-            OR mf.album LIKE ? COLLATE NOCASE
-            OR mf.title LIKE ? COLLATE NOCASE
-            OR mf.full_text LIKE ? COLLATE NOCASE)
-            """
-            params.extend([like, like, like, like])
+            scope_fields = [
+                "mf.artist",
+                "mf.album",
+                "mf.title",
+                "mf.full_text",
+            ]
+
+        search_clauses: list[str] = []
+        params: list[object] = []
+        for search_term in terms:
+            like = f"%{search_term}%"
+            search_clauses.append(
+                "(" + " OR ".join(f"{field} LIKE ? COLLATE NOCASE" for field in scope_fields) + ")"
+            )
+            params.extend([like] * len(scope_fields))
+
+        scope_sql = " AND ".join(search_clauses)
 
         rating_expr = "COALESCE(NULLIF(ann.rating, 0), CAST(ROUND(mf.average_rating) AS INTEGER), 0)"
 
