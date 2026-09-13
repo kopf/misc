@@ -28,7 +28,7 @@ def process_videos():
         if file_path.suffix.lower() not in VIDEO_EXTENSIONS:
             continue
 
-        output_txt_path = file_path.with_suffix(".txt")
+        output_txt_path = Path(str(Path('.') / os.path.basename(file_path)) + '.txt')
         if output_txt_path.exists():
             print(f"Skipping (already transcribed): {file_path.name}")
             continue
