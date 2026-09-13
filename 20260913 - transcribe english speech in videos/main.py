@@ -1,8 +1,9 @@
-/// script
+#!/usr/bin/env -S uv run --script
+# /// script
 # dependencies = [
 #     "faster-whisper",
 # ]
-///
+# ///
 
 import os
 from pathlib import Path
