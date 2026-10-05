@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Substrate</title>
+<style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #fff; }
+    canvas { display: block; width: 100vw; height: 100vh; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/*
+ * Port of xscreensaver's substrate.c (dragorn / dagraz), itself a port of
+ * j.tarbell's Substrate (complexification.net, 2004).
+ *
+ * Options mirror the xscreensaver resources and may be given as URL query params, e.g.
+ *   index.html?circlePercent=0&maxCracks=200&wireframe=1&background=black&foreground=white
+ */
+"use strict";
+
+const STEP = 0.42;
+
+// Raw colormap extracted from pollockEFF.gif
+const RGB_COLORMAP = [
+    "#201F21", "#262C2E", "#352626", "#372B27", "#302C2E", "#392B2D", "#323229", "#3F3229",
+    "#38322E", "#2E333D", "#333A3D", "#473329", "#40392C", "#40392E", "#47402C", "#47402E",
+    "#4E402C", "#4F402E", "#4E4738", "#584037", "#65472D", "#6D5D3D", "#745530", "#755532",
+    "#745D32", "#746433", "#7C6C36", "#523152", "#444842", "#4C5647", "#655D45", "#6D5D44",
+    "#6C5D4E", "#746C43", "#7C6C42", "#7C6C4B", "#6B734B", "#73734B", "#7B7B4A", "#6B6C55",
+    "#696D5E", "#7B6C5D", "#6B7353", "#6A745D", "#727B52", "#7B7B52", "#57746E", "#687466",
+    "#9C542B", "#9D5432", "#9D5B35", "#936B36", "#AA7330", "#C45A27", "#D95223", "#D85A20",
+    "#DB5A23", "#E57037", "#836C4B", "#8C6B4B", "#82735C", "#937352", "#817B63", "#817B6D",
+    "#927B63", "#D9893B", "#E49832", "#DFA133", "#E5A037", "#F0AB3B", "#8A8A59", "#B29A58",
+    "#89826B", "#9A8262", "#888B7C", "#909A7A", "#A28262", "#A18A69", "#A99968", "#99A160",
+    "#99A168", "#CA8148", "#EB8D43", "#C29160", "#C29168", "#D1A977", "#C9B97F", "#F0E27B",
+    "#9F928B", "#C0B999", "#E6B88F", "#C8C187", "#E0C886", "#F2CC85", "#F5DA83", "#ECDE9D",
+    "#F5D294", "#F5DA94", "#F4E784", "#F4E18A", "#F4E193", "#E7D8A7", "#F1D4A5", "#F1DCA5",
+    "#F4DBAD", "#F1DCAE", "#F4DBB5", "#F5DBBD", "#F4E2AD", "#F5E9AD", "#F4E3BE", "#F5EABE",
+    "#F7F0B6", "#D9D1C1", "#E0D0C0", "#E7D8C0", "#F1DDC6", "#E8E1C0", "#F3EDC7", "#F6ECCE",
+    "#F8F2C7", "#EFEFD0",
+];
+
+const params = new URLSearchParams(location.search);
+const intParam = (name, def) => {
+    const v = parseInt(params.get(name), 10);
+    return Number.isFinite(v) ? v : def;
+};
+
+const cfg = {
+    background: params.get("background") || "white",
+    foreground: params.get("foreground") || "black",
+    wireframe: ["1", "true", "yes"].includes((params.get("wireframe") || "").toLowerCase()),
+    maxCycles: intParam("maxCycles", 10000),
+    growthDelay: intParam("growthDelay", 18000), // microseconds, as in xscreensaver
+    initialCracks: Math.max(3, intParam("initialCracks", 3)),
+    maxCracks: Math.max(11, intParam("maxCracks", 100)),
+    sandGrains: Math.max(2, intParam("sandGrains", 64)),
+    circlePercent: Math.min(100, Math.max(0, intParam("circlePercent", 33))),
+};
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+function parseColor(css) {
+    const probe = document.createElement("canvas").getContext("2d");
+    probe.fillStyle = css;
+    probe.fillRect(0, 0, 1, 1);
+    const [r, g, b] = probe.getImageData(0, 0, 1, 1).data;
+    return [r, g, b];
+}
+
+const palette = RGB_COLORMAP.map(parseColor);
+const fgColor = parseColor(cfg.foreground);
+const bgColor = parseColor(cfg.background);
+document.body.style.background = cfg.background;
+
+// C helpers: random() % n, frand(x), and (int) casts truncating toward zero.
+const rand = (n) => Math.floor(Math.random() * n);
+const frand = (x) => Math.random() * x;
+const trunc = Math.trunc;
+const DEG = Math.PI / 180;
+
+const f = {
+    width: 0, height: 0,
+    num: 0,
+    cracks: [],
+    cgrid: null,  // Int32Array, so stores truncate like the C int grid
+    img: null,    // ImageData doubling as off_img and the window contents
+    pix: null,
+    cycles: 0,
+};
+
+function setPixel(x, y, c) {
+    const i = (y * f.width + x) * 4;
+    f.pix[i] = c[0];
+    f.pix[i + 1] = c[1];
+    f.pix[i + 2] = c[2];
+}
+
+// Alpha-blended point drawing; coordinates arrive as floats and are cast to int.
+function transPoint(fx, fy, c, a) {
+    const x = trunc(fx), y = trunc(fy);
+    if (x < 0 || x >= f.width || y < 0 || y >= f.height) return;
+    const i = (y * f.width + x) * 4;
+    const p = f.pix;
+    if (a >= 1.0) {
+        p[i] = c[0]; p[i + 1] = c[1]; p[i + 2] = c[2];
+    } else {
+        p[i] = trunc(p[i] + (c[0] - p[i]) * a);
+        p[i + 1] = trunc(p[i + 1] + (c[1] - p[i + 1]) * a);
+        p[i + 2] = trunc(p[i + 2] + (c[2] - p[i + 2]) * a);
+    }
+}
+
+function startCrack(cr) {
+    let px = 0, py = 0, found = false, timeout = 0;
+
+    while (!found && timeout++ < 10000) {
+        px = rand(f.width);
+        py = rand(f.height);
+        if (f.cgrid[py * f.width + px] < 10000) found = true;
+    }
+
+    if (!found) {
+        px = Math.min(Math.max(trunc(cr.x), 0), f.width - 1);
+        py = Math.min(Math.max(trunc(cr.y), 0), f.height - 1);
+        f.cgrid[py * f.width + px] = cr.t;
+    }
+
+    let a = f.cgrid[py * f.width + px];
+    if (rand(100) < 50) {
+        a -= 90 + (frand(4.1) - 2.0);
+    } else {
+        a += 90 + (frand(4.1) - 2.0);
+    }
+
+    if (rand(100) < cfg.circlePercent) {
+        cr.curved = true;
+        cr.degreesDrawn = 0;
+
+        let r = 10 + rand(Math.floor((f.width + f.height) / 2));
+        if (rand(100) < 50) r *= -1;
+
+        // arc length = r * theta => theta = arc length / r
+        const radianInc = STEP / r;
+        cr.tInc = radianInc * 360 / 2 / Math.PI;
+        cr.ys = r * Math.sin(radianInc);
+        cr.xs = r * (1 - Math.cos(radianInc));
+    } else {
+        cr.curved = false;
+    }
+
+    cr.x = px + 0.61 * Math.cos(a * DEG);
+    cr.y = py + 0.61 * Math.sin(a * DEG);
+    cr.t = a;
+}
+
+function makeCrack() {
+    if (f.num >= cfg.maxCracks) return;
+    const cr = {
+        x: rand(f.width),
+        y: rand(f.height),
+        t: rand(360),
+        xs: 0, ys: 0, tInc: 0,
+        curved: false,
+        degreesDrawn: 0,
+        sandcolor: palette[rand(palette.length)],
+        sandp: 0,
+        sandg: frand(0.2) - 0.01,
+    };
+    f.cracks.push(cr);
+    startCrack(cr);
+    f.num++;
+}
+
+function regionColor(cr) {
+    let rx = cr.x, ry = cr.y;
+    const s = Math.sin(cr.t * DEG), c = Math.cos(cr.t * DEG);
+
+    // move perpendicular to the crack until hitting another crack or the edge
+    for (;;) {
+        rx += 0.81 * s;
+        ry -= 0.81 * c;
+        const cx = trunc(rx), cy = trunc(ry);
+        if (cx < 0 || cx >= f.width || cy < 0 || cy >= f.height) break;
+        if (f.cgrid[cy * f.width + cx] <= 10000) break;
+    }
+
+    cr.sandg += frand(0.1) - 0.050;
+    if (cr.sandg < 0) cr.sandg = 0;
+    if (cr.sandg > 1.0) cr.sandg = 1.0;
+
+    const grains = cfg.sandGrains;
+    const w = cr.sandg / (grains - 1);
+    for (let i = 0; i < grains; i++) {
+        const k = Math.sin(cr.sandp + Math.sin(i * w));
+        transPoint(cr.x + (rx - cr.x) * k, cr.y + (ry - cr.y) * k,
+                   cr.sandcolor, 0.1 - i / (grains * 10.0));
+    }
+}
+
+function restartOutOfBounds(cr) {
+    cr.x = rand(f.width);
+    cr.y = rand(f.height);
+    cr.t = rand(360);
+    startCrack(cr);
+    makeCrack();
+}
+
+function moveDrawCrack(cr) {
+    if (!cr.curved) {
+        cr.x += STEP * Math.cos(cr.t * DEG);
+        cr.y += STEP * Math.sin(cr.t * DEG);
+    } else {
+        cr.x += cr.ys * Math.cos(cr.t * DEG);
+        cr.y += cr.ys * Math.sin(cr.t * DEG);
+        cr.x += cr.xs * Math.cos(cr.t * DEG - Math.PI / 2);
+        // Faithful to the original: this updates x rather than y.
+        cr.x += cr.xs * Math.sin(cr.t * DEG - Math.PI / 2);
+        cr.t += cr.tInc;
+        // C's integer abs() truncates the float increment.
+        cr.degreesDrawn += trunc(Math.abs(cr.tInc));
+    }
+
+    const cx = trunc(cr.x + (frand(0.66) - 0.33));
+    const cy = trunc(cr.y + (frand(0.66) - 0.33));
+
+    if (cx < 0 || cx >= f.width || cy < 0 || cy >= f.height) {
+        restartOutOfBounds(cr);
+        return;
+    }
+
+    if (!cfg.wireframe) regionColor(cr);
+    setPixel(cx, cy, fgColor);
+
+    const idx = cy * f.width + cx;
+    const g = f.cgrid[idx];
+    if (cr.curved && cr.degreesDrawn > 360) {
+        startCrack(cr);
+        makeCrack();
+    } else if (g > 10000 || Math.abs(trunc(g - cr.t)) < 5) {
+        f.cgrid[idx] = cr.t;
+    } else if (Math.abs(trunc(g - cr.t)) > 2) {
+        startCrack(cr);
+        makeCrack();
+    }
+}
+
+function buildImg() {
+    f.img = ctx.createImageData(f.width, f.height);
+    f.pix = f.img.data;
+    for (let i = 0; i < f.pix.length; i += 4) {
+        f.pix[i] = bgColor[0];
+        f.pix[i + 1] = bgColor[1];
+        f.pix[i + 2] = bgColor[2];
+        f.pix[i + 3] = 255;
+    }
+}
+
+function buildSubstrate() {
+    f.cycles = 0;
+    f.cracks = [];
+    f.num = 0;
+    f.cgrid = new Int32Array(f.width * f.height).fill(10001);
+    for (let i = 0; i < cfg.initialCracks; i++) makeCrack();
+}
+
+function resize() {
+    f.width = canvas.width = window.innerWidth;
+    f.height = canvas.height = window.innerHeight;
+    buildSubstrate();
+    buildImg();
+}
+
+function cycle() {
+    if (f.cycles % 10 === 0 &&
+        (f.width !== window.innerWidth || f.height !== window.innerHeight)) {
+        resize();
+    }
+
+    // f.num may grow during the loop; newly made cracks also move this cycle, as in C.
+    for (let i = 0; i < f.num; i++) moveDrawCrack(f.cracks[i]);
+
+    f.cycles++;
+    if (cfg.maxCycles !== 0 && f.cycles >= cfg.maxCycles) {
+        buildSubstrate();
+        buildImg();
+    }
+}
+
+const delayMs = Math.max(cfg.growthDelay / 1000, 0.001);
+let last = performance.now();
+let acc = 0;
+
+function frame(now) {
+    acc += now - last;
+    last = now;
+    // Cap catch-up work so a backgrounded tab doesn't stall on return.
+    let steps = Math.min(Math.floor(acc / delayMs), 50);
+    acc = steps === 50 ? 0 : acc - steps * delayMs;
+    while (steps-- > 0) cycle();
+    ctx.putImageData(f.img, 0, 0);
+    requestAnimationFrame(frame);
+}
+
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
