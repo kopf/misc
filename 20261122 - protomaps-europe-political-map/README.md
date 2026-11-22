@@ -1,7 +1,8 @@
 # Protomaps political map of Europe
 
 A self-contained Python script producing a **PNG and genuinely vector SVG** of
-country borders and country-specific administrative divisions. It uses
+country borders and country-specific administrative divisions, with **country
+and regional names**. It uses
 Protomaps v4 PMTiles directly, projects the geometry to Europe Lambert azimuthal
 equal-area (EPSG:3035), and renders it with Matplotlib. No browser, API key,
 Node.js, or full-planet download is required. Source boundaries are not simplified
@@ -10,8 +11,10 @@ supplementary boundaries use the full-resolution GeoJSON, not simplified downloa
 Only internal subdivision edges are overlaid from those supplements: their older
 coastlines and country perimeters are not mistaken for additional political lines.
 
-Only land/sea, coastlines, political boundaries and optional country labels are
-rendered. There are **no mountains, rivers, lakes, roads, cities, or landcover**.
+Only land/sea, coastlines, political boundaries and optional administrative labels
+are rendered. There are **no mountains, rivers, lakes, roads, city layers, or
+landcover**. City-state/department names such as Berlin or Paris are included
+because they are themselves selected administrative units, not as city markers.
 
 ## Run
 
@@ -24,15 +27,18 @@ cd "20261122 - protomaps-europe-political-map"
 
 `uv` obtains the script's inline dependencies automatically. Outputs:
 
-- `output/europe.png` — 3200 × 2600 pixels by default.
-- `output/europe.svg` — vector paths and editable text, not an embedded PNG.
+- `output/europe.png` — **12000 × 9750 pixels** by default, to make room for regional names.
+- `output/europe.svg` — vector paths, including outlined label glyphs for consistent
+  typography across viewers; not an embedded PNG. `--editable-svg-text` keeps
+  text editable instead, but depends on the viewer's fonts.
 - `output/europe.sources.json` — archive identity, source URLs and hashes,
   division choices, coverage diagnostics, supplementary data and limitations.
 
 The first run downloads only the necessary ranges of the Source Cooperative
 Protomaps archive, plus source documents. Expect a few minutes and potentially
 hundreds of MB, depending on the archive. The full export can use around 1 GB
-of RAM while merging detailed geometry. Download and country-selection loops
+of RAM while merging detailed geometry; the larger labelled export can use
+roughly 2–3 GB including the image canvas and label source polygons. Download and country-selection loops
 show progress bars. Subsequent runs reuse `.cache/`. Both generated files and
 the cache are ignored by Git.
 
@@ -44,8 +50,18 @@ For newer data, pass a newer Protomaps v4 archive or a local cutout.
 ## Options
 
 ```bash
-# Larger export, without country labels
-./main.py --width 6000 --height 4800 --no-labels
+# Larger labelled export
+./main.py --width 16000 --height 13000
+
+# Country labels only (no regional names/insets)
+./main.py --no-region-labels
+
+# No labels at all, restoring a smaller export
+./main.py --width 3200 --height 2600 --no-labels
+
+# Adjust text size or use the main map without inset panels
+./main.py --region-fontsize 10 --country-fontsize 24
+./main.py --no-insets
 
 # A region/subset: use three-letter country codes, KOS for Kosovo
 ./main.py --countries IRL,GBR --bounds -11 49 3 61 --output output/britain-ireland
@@ -65,7 +81,9 @@ For newer data, pass a newer Protomaps v4 archive or a local cutout.
 ```
 
 A local archive must contain the `earth` and `boundaries` MVT layers and zooms
-**6 through 10** for the full map. Restricting an extract to the map's visual
+**6 through 12** for the default labelled map with detailed inset coastlines
+(z12 for Monaco/Malta, z10 for the other small-state insets). With `--no-insets`,
+zoom levels **6 through 10** suffice. Restricting an extract to the map's visual
 zoom (roughly 4–5) would silently lose counties and départements. This script
 explicitly reads z8 boundaries for OSM admin levels 5/6 and z10 for levels 7/8,
 regardless of the output image size. HTTP servers must support genuine byte
@@ -89,10 +107,28 @@ Overseas territories outside the viewport are not shown. Åland is included with
 Finland. Non-sovereign territories stored separately by Natural Earth (e.g.
 Jersey, Guernsey and the Faroe Islands) are not separate configured countries.
 
-Small states and fine subdivisions remain present in the SVG, but may be hard
-to distinguish at continental scale. Some crowded country labels are omitted;
-no administrative-unit names are drawn. Increase the resolution or render a
-regional subset to inspect fine detail.
+## Label legibility
+
+Country names are larger, bold and uppercase; regional names are smaller and
+use the source's English name when available, otherwise its local name. The
+script measures text at the final output size and checks **padded label
+rectangles for overlap**. Names are wrapped where necessary. Displaced names
+have thin leader lines and dots locating the relevant administrative area—not
+cities. No label is silently dropped to make the map fit: an impossible layout
+fails with a request to increase `--width`/`--height`.
+
+**Luxembourg, Andorra, Liechtenstein, Monaco, San Marino and Malta** have regional
+labels in dedicated inset panels rather than unreadable text on continental-scale
+areas. Their country names remain on the main map. Inset geography uses more
+detailed Protomaps tiles rather than magnifying the main map's z6 outline.
+
+The default 9 pt regional labels are about 12.5 pixels high at native PNG size.
+View the PNG at full resolution or zoom into the SVG; fitting a 12000-pixel-wide
+image into a small window inevitably makes those labels too small to read.
+SVG glyph outlines ensure that the font metrics used for overlap checking do
+not change on machines without DejaVu Sans. Label strings, placements and panel
+identifiers are also recorded in the source JSON. If you want editable text,
+use `--editable-svg-text` and ensure DejaVu Sans is installed in your viewer.
 
 ## Agreed administrative divisions
 
@@ -181,6 +217,34 @@ or statistical regions, not Länder-style regional governments.
    drawn more faintly. The grouping follows the development-region framework,
    not a claim about sovereignty or the existence of six regional governments.
 
+### Sources for regional names
+
+`geolabels.py` supplies label polygons independently of the drawing layers, so
+adding text does not replace or alter the agreed political boundaries:
+
+- Natural Earth named administrative polygons are used where their level matches
+  the selected divisions. Italian provinces are grouped into the **20 regions**;
+  Åland's municipality polygons are grouped into one Finnish autonomous region.
+- ONS December 2025 county/unitary-authority polygons supply Great Britain's
+  modern names. Metropolitan districts are grouped into their **six metropolitan
+  counties**; London boroughs into **Greater London**, while the **City of London**
+  remains separate. NI still uses the six traditional Irish county polygons.
+  UK constituent-country names are labelled as well. ONS data use OGL v3.0;
+  attribution: Contains OS data © Crown copyright and database right 2025.
+- Kartverket's official county API supplies Norway's **15 modern counties**,
+  avoiding outdated 11- or 19-county name lists.
+- The existing GISCO regions supply Slovenia, Latvia and North Macedonia's names;
+  Moldova's district polygons are dissolved into the same six development regions
+  used for the boundaries. Irish names use the original 32 traditional counties.
+- geoBoundaries supplies appropriately scoped names for several special cases.
+  Hungary's actual source file contains 19 counties despite metadata saying 20;
+  Budapest is added as the distinct capital unit, not as an ordinary city label.
+- A single cached OSM/Nominatim administrative-relation lookup supplies Métropole
+  de Lyon, Montenegro's newer Tuzi/Zeta/updated Podgorica polygons, and Malta's
+  six regional areas. It checks their administrative levels and does not use
+  arbitrary city-search results. Source URLs, hashes and licence notes are kept
+  in the manifest. Labels use the same snapshot caveats as their source data.
+
 The script **fails by default if no target-level lines are detected for a
 country**, writes diagnostics to the manifest, and suggests a custom overlay.
 This catches absent levels but **does not establish that every individual unit
@@ -194,6 +258,11 @@ FeatureCollection containing polygons or lines:
 ./main.py --overlay GBR=/path/to/county-boundaries.geojson
 ```
 
+With regional labels enabled, custom overlay features must also have a
+`properties.name` (or `shapeName`/`NUTS_NAME`) and geometry. Polygons allow
+interior placement; named lines get callouts. Use `--no-region-labels` for an
+unnamed overlay.
+
 Retain your overlay's source and licensing separately. `--allow-missing` permits
 known omissions explicitly and records warnings; it is not the default.
 
@@ -205,5 +274,7 @@ known omissions explicitly and records warnings; it is not the default.
 
 The offline tests exercise division choices, tile-coordinate orientation,
 polygon holes, zoom/level filtering, safe HTTP range handling, CLI validation,
-and an end-to-end synthetic PMTiles export. The export test checks PNG dimensions
-and confirms that the SVG contains paths and no raster image element.
+and an end-to-end synthetic PMTiles export. They also test dense label placement,
+explicit failure when labels cannot fit, UK county grouping (not borough labels),
+and Italian regional grouping (not province labels). The export test checks PNG
+dimensions and confirms that the SVG contains paths and no raster image element.

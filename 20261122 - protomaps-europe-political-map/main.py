@@ -17,7 +17,7 @@ import json
 import mmap
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -29,6 +29,13 @@ import click
 import httpx
 import json5
 import matplotlib
+from geolabels import (
+    INSET_COUNTRIES,
+    NamedRegion,
+    PlotLabel,
+    RegionCatalogue,
+    place_labels,
+)
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -51,6 +58,8 @@ DEFAULT_PMTILES = "https://data.source.coop/protomaps/openstreetmap/v4.pmtiles"
 NE_REV = "ca96624a56bd078437bca8184e78163e5039ad19"
 NE_URL = (f"https://raw.githubusercontent.com/nvkelso/natural-earth-vector/{NE_REV}"
           "/geojson/ne_10m_admin_0_countries.geojson")
+NE_ADMIN1_URL = (f"https://raw.githubusercontent.com/nvkelso/natural-earth-vector/{NE_REV}"
+                 "/geojson/ne_10m_admin_1_states_provinces.geojson")
 EUROPE_URL = (f"https://raw.githubusercontent.com/nvkelso/natural-earth-vector/{NE_REV}"
               "/geojson/ne_10m_geography_regions_polys.geojson")
 IRISH_REV = "b168df19afa9874c139e39365cbc1863f10098f7"
@@ -163,7 +172,7 @@ class Downloads:
         else:
             for attempt in range(4):
                 try:
-                    response = self.client.get(url)
+                    response = self.client.get(url, headers={"User-Agent": "EuropePoliticalMap/1.0 (personal cartographic script)"})
                     response.raise_for_status()
                     data = response.content
                     break
@@ -515,51 +524,131 @@ def add_lines(ax: Any, geometry: Geometry, color: str, width: float, zorder: int
         ax.add_collection(collection)
 
 
+@dataclass
+class InsetMap:
+    land: Geometry
+    coastline: Geometry
+    countries: Geometry
+    disputed: Geometry
+    footprint: Geometry
+
+
+def collect_insets(reader: Reader, geographic_masks: dict[str, Geometry], header: dict[str, Any],
+                   workers: int) -> dict[str, InsetMap]:
+    result = {}
+    for code in tqdm([c for c in INSET_COUNTRIES if c in geographic_masks], desc="Detailed insets", unit="country"):
+        # Coastal microstates need finer coastlines; landlocked states need z10
+        # national borders. Do not magnify the coarse z6 country outline.
+        zoom = 12 if code in {"MCO", "MLT"} else 10
+        if header["max_zoom"] < zoom:
+            raise click.ClickException(f"Detailed {code} inset requires z{zoom}. Use a deeper archive or --no-insets.")
+        geometry = geographic_masks[code]
+        west, south, east, north = geometry.bounds
+        margin = max(east - west, north - south) * 0.4 + 0.02
+        # Include the entire inset viewport, not just tiles touching the country;
+        # otherwise surrounding land acquires spurious staircase-shaped cutouts.
+        jobs = tiles_for(geometry.envelope.buffer(margin), zoom)
+        batch = collect_tiles(reader, jobs, header["tile_compression"], True, workers, f"Inset {code} z{zoom}")
+        country_parts, disputed_parts = [], []
+        for (level, disputed_flag, _zoom), geometries in batch.boundaries.items():
+            if level == 2:
+                (disputed_parts if disputed_flag else country_parts).extend(geometries)
+        result[code] = InsetMap(union_all(batch.land), union_all(batch.coastline),
+                                union_all(country_parts), union_all(disputed_parts), project(geometry))
+    return result
+
+
+def visible_region_labels(regions: list[NamedRegion], geographic_masks: dict[str, Geometry],
+                          land: Geometry, insets: dict[str, InsetMap], viewport: Geometry) -> list[PlotLabel]:
+    result = []
+    for region in tqdm(regions, desc="Locating region labels", unit="region"):
+        mask = viewport if region.country in insets else geographic_masks[region.country]
+        clipped = region.geometry.intersection(mask)
+        if clipped.is_empty:
+            continue  # overseas/Asian parts outside the requested viewport
+        visible_land = insets[region.country].land if region.country in insets else land
+        visible = project(clipped).intersection(visible_land)
+        if visible.is_empty:
+            continue
+        if region.geometry.geom_type in {"Polygon", "MultiPolygon"} and visible.area == 0:
+            continue
+        result.append(PlotLabel(region.key, region.country, region.name, visible, region.tier))
+    return result
+
+
+def draw_map_layers(ax: Any, land: Geometry, coastline: Geometry, admin: Geometry,
+                    countries: Geometry, disputed: Geometry, land_color: str,
+                    admin_width: float, country_width: float, uk: Geometry | None = None) -> None:
+    for polygon in polygons(land):
+        ax.add_patch(PathPatch(polygon_path(polygon), facecolor=land_color, edgecolor="none", zorder=1))
+    add_lines(ax, coastline, "#858585", 0.35, 2)
+    add_lines(ax, admin, "#777777", admin_width, 3)
+    if uk is not None:
+        add_lines(ax, uk, "#383838", (admin_width + country_width) / 2, 4)
+    add_lines(ax, countries, "#252525", country_width, 5)
+    add_lines(ax, disputed, "#252525", country_width, 6, dashed=True)
+
+
 def render(land: Geometry, coastline: Geometry, admin: Geometry, countries: Geometry, disputed: Geometry,
            uk: Geometry, masks: dict[str, Geometry], output: Path, width: int, height: int,
            labels: bool, land_color: str, sea_color: str, admin_width: float,
-           country_width: float, tolerance: float) -> None:
-    matplotlib.rcParams["svg.fonttype"] = "none"  # Editable text, not embedded raster images.
+           country_width: float, region_labels: list[PlotLabel], insets: dict[str, InsetMap],
+           region_fontsize: float, country_fontsize: float, editable_svg_text: bool) -> dict[str, Any]:
+    # Outlined vector glyphs keep the checked font metrics identical in SVG
+    # viewers without DejaVu installed. Editable text remains an explicit option.
+    matplotlib.rcParams["svg.fonttype"] = "none" if editable_svg_text else "path"
     fig = plt.figure(figsize=(width / 100, height / 100), dpi=100, facecolor=sea_color)
-    ax = fig.add_axes((0.015, 0.045, 0.97, 0.94), facecolor=sea_color)
-    ax.set_aspect("equal")
-    ax.set_axis_off()
-    xmin, ymin, xmax, ymax = union_all(list(masks.values())).bounds
-    padding = max(xmax - xmin, ymax - ymin) * 0.025
-    ax.set_xlim(xmin - padding, xmax + padding)
-    ax.set_ylim(ymin - padding, ymax + padding)
-    for polygon in polygons(land.simplify(tolerance, preserve_topology=True)):
-        ax.add_patch(PathPatch(polygon_path(polygon), facecolor=land_color, edgecolor="none", zorder=1))
-    add_lines(ax, coastline.simplify(tolerance), "#858585", 0.35, 2)
-    add_lines(ax, admin.simplify(tolerance), "#777777", admin_width, 3)
-    add_lines(ax, uk.simplify(tolerance), "#383838", (admin_width + country_width) / 2, 4)
-    add_lines(ax, countries.simplify(tolerance), "#252525", country_width, 5)
-    add_lines(ax, disputed.simplify(tolerance), "#252525", country_width, 6, dashed=True)
-    if labels:
-        # Label the largest visible part, not distant islands/overseas possessions.
-        placed = []
-        for code, mask in sorted(masks.items(), key=lambda item: item[1].area, reverse=True):
-            largest = max(polygons(mask), key=lambda p: p.area, default=None)
-            if largest is None:
-                continue
-            point = largest.representative_point()
-            # Small countries are still drawn, but omit crowded labels at this scale.
-            if any(point.distance(other) < 105000 for other in placed):
-                continue
-            placed.append(point)
-            ax.text(point.x, point.y, DIVISIONS[code].name, fontsize=7.5, color="#303030",
-                    ha="center", va="center", zorder=10,
-                    bbox={"facecolor": land_color, "edgecolor": "none", "alpha": 0.8, "pad": 1})
-    fig.text(0.02, 0.017,
-             "Protomaps · © OpenStreetMap contributors — openstreetmap.org/copyright (ODbL) · Natural Earth · Irish counties: J. McCullagh (GPL-3.0)\n"
-             "Supplementary boundaries: geoBoundaries / OSM (ODbL / CC BY-SA 2.0) · Eurostat GISCO / © EuroGeographics · Source details in accompanying JSON",
-             fontsize=6, color="#555555", va="bottom")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    for suffix in (".png", ".svg"):
-        path = output.with_suffix(suffix)
-        fig.savefig(path, dpi=100, facecolor=sea_color)
-        click.echo(f"Wrote {path}")
-    plt.close(fig)
+    try:
+        ax = fig.add_axes((0.015, 0.055, 0.77 if insets else 0.97, 0.91), facecolor=sea_color)
+        ax.set_aspect("equal")
+        ax.set_axis_off()
+        xmin, ymin, xmax, ymax = union_all(list(masks.values())).bounds
+        padding = max(xmax - xmin, ymax - ymin) * 0.035
+        ax.set_xlim(xmin - padding, xmax + padding)
+        ax.set_ylim(ymin - padding, ymax + padding)
+        draw_map_layers(ax, land, coastline, admin, countries, disputed,
+                        land_color, admin_width, country_width, uk)
+        layout = {"panels": [], "region_labels": len(region_labels), "svg_text": "editable" if editable_svg_text else "outlined vector glyphs"}
+        if labels:
+            main_labels = [PlotLabel(f"country:{code}", code, DIVISIONS[code].name,
+                                     insets[code].footprint if code in insets else mask, "country")
+                           for code, mask in masks.items()]
+            main_labels.extend(label for label in region_labels if label.country not in insets)
+            info = place_labels(ax, main_labels, region_fontsize, country_fontsize, "Main-map labels")
+            layout["panels"].append({"name": "main", **info})
+        rows = len(insets)
+        for index, (code, inset) in enumerate(insets.items()):
+            row_height = 0.91 / rows
+            panel = fig.add_axes((0.815, 0.055 + (rows - index - 1) * row_height,
+                                  0.17, row_height - 0.025), facecolor=sea_color)
+            panel.set_aspect("equal")
+            panel.set_axis_off()
+            x0, y0, x1, y1 = inset.footprint.bounds
+            pad = max(x1 - x0, y1 - y0) * 0.18
+            panel.set_xlim(x0 - pad, x1 + pad)
+            panel.set_ylim(y0 - pad, y1 + pad)
+            frame = box(x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+            own = inset.footprint.buffer(750)
+            draw_map_layers(panel, inset.land.intersection(frame), inset.coastline.intersection(frame),
+                            admin.intersection(own), inset.countries.intersection(frame),
+                            inset.disputed.intersection(frame), land_color, admin_width, country_width)
+            panel.set_title(DIVISIONS[code].name, fontsize=18, weight="bold", pad=10)
+            names = [label for label in region_labels if label.country == code]
+            info = place_labels(panel, names, region_fontsize, country_fontsize, f"{code} inset labels")
+            layout["panels"].append({"name": code, **info})
+        fig.text(0.02, 0.014,
+                 "Protomaps · © OpenStreetMap contributors — openstreetmap.org/copyright (ODbL) · Natural Earth · Irish counties: J. McCullagh (GPL-3.0)\n"
+                 "geoBoundaries / OSM (ODbL / CC BY-SA 2.0) · Eurostat GISCO / © EuroGeographics · Kartverket · Contains OS data © Crown copyright and database right 2025\n"
+                 "Dots and thin grey leaders locate administrative labels, not cities. Small-state regions are labelled in the insets. Sources and label text are in the accompanying JSON.",
+                 fontsize=8 if region_labels else 6, color="#555555", va="bottom")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        for suffix in (".png", ".svg"):
+            path = output.with_suffix(suffix)
+            fig.savefig(path, dpi=100, facecolor=sea_color)
+            click.echo(f"Wrote {path}")
+        return layout
+    finally:
+        plt.close(fig)
 
 
 def prepare_boundaries(data: TileData, masks: dict[str, Geometry], levels: dict[str, Division],
@@ -619,10 +708,15 @@ def prepare_boundaries(data: TileData, masks: dict[str, Geometry], levels: dict[
 @click.option("--bounds", nargs=4, type=float, default=(-32, 27, 68, 72), show_default=True,
               help="West south east north, in longitude/latitude. Russia is restricted to Natural Earth's continental Europe extent.")
 @click.option("--countries", "country_codes", help="Optional comma-separated ISO3 subset (Kosovo: KOS). Defaults to all configured countries.")
-@click.option("--width", type=click.IntRange(200, 20000), default=3200, show_default=True)
-@click.option("--height", type=click.IntRange(200, 20000), default=2600, show_default=True)
+@click.option("--width", type=click.IntRange(200, 30000), default=12000, show_default=True)
+@click.option("--height", type=click.IntRange(200, 30000), default=9750, show_default=True)
 @click.option("--workers", type=click.IntRange(1, 16), default=6, show_default=True)
-@click.option("--labels/--no-labels", default=True, show_default=True)
+@click.option("--labels/--no-labels", default=True, show_default=True, help="Enable/disable all map labels.")
+@click.option("--region-labels/--no-region-labels", default=True, show_default=True, help="Also label every displayed administrative division.")
+@click.option("--insets/--no-insets", "insets_enabled", default=True, show_default=True, help="Put small-state regional labels in detailed inset panels.")
+@click.option("--region-fontsize", type=click.FloatRange(min=6, max=36), default=9.0, show_default=True, help="Regional label size in points, at 100 dpi.")
+@click.option("--country-fontsize", type=click.FloatRange(min=6, max=72), default=22.0, show_default=True)
+@click.option("--editable-svg-text", is_flag=True, help="Keep SVG text editable instead of outlining glyphs; viewer fonts may differ.")
 @click.option("--land-color", default="#f0eee9", show_default=True)
 @click.option("--sea-color", default="white", show_default=True)
 @click.option("--admin-width", type=click.FloatRange(min=0.01), default=0.35, show_default=True, help="Stroke width in points.")
@@ -632,7 +726,8 @@ def prepare_boundaries(data: TileData, masks: dict[str, Geometry], levels: dict[
 @click.option("--list-divisions", is_flag=True, help="Print the per-country division choices and exit.")
 def main(source: str, output: Path, cache: Path, bounds: tuple[float, float, float, float],
          country_codes: str | None, width: int, height: int, workers: int, labels: bool,
-         land_color: str, sea_color: str, admin_width: float, country_width: float,
+         region_labels: bool, insets_enabled: bool, region_fontsize: float, country_fontsize: float,
+         editable_svg_text: bool, land_color: str, sea_color: str, admin_width: float, country_width: float,
          overlay: tuple[str, ...], allow_missing: bool, list_divisions: bool) -> None:
     """Draw country borders and the agreed administrative divisions, with no physical detail.
 
@@ -671,7 +766,7 @@ def main(source: str, output: Path, cache: Path, bounds: tuple[float, float, flo
         masks = {code: project(mask) for code, mask in geographic_masks.items()}
         ni = GeometryCollection()
         irish = {}
-        if (codes & {"IRL", "GBR"}) and geographic_bounds.intersects(box(-11, 51, -5, 56)):
+        if (codes & {"IRL", "GBR"}) and (geographic_bounds.intersects(box(-11, 51, -5, 56)) or (labels and region_labels)):
             irish = irish_counties(downloads, workers)
             ni = project(union_all([irish[name] for name in NI_COUNTIES]))
         if source.startswith(("https://", "http://")):
@@ -790,6 +885,25 @@ def main(source: str, output: Path, cache: Path, bounds: tuple[float, float, flo
             extra.append(projected)
             report[code] = {"source": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                             "note": "User-supplied overlay; source licensing must be retained by the user."}
+        inset_maps = {}
+        plot_labels = []
+        label_sources = []
+        if labels and region_labels:
+            catalogue = RegionCatalogue(downloads, NE_ADMIN1_URL, geoboundaries_features,
+                                        GISCO_NUTS3_URL, REGIONAL_NUTS, MOLDOVA_DEVELOPMENT_UNITS)
+            custom_collections = {code: json.loads(path.read_text()) for code, path in custom.items() if code in masks}
+            named = catalogue.build(set(masks), irish, NI_COUNTIES, custom_collections)
+            if insets_enabled:
+                inset_geographies = dict(geographic_masks)
+                for code in INSET_COUNTRIES:
+                    pieces = [region.geometry for region in named if region.country == code]
+                    if code in inset_geographies and pieces:
+                        # Named polygons locate the actual small country better
+                        # than generalised country masks (notably Monaco).
+                        inset_geographies[code] = union_all(pieces).intersection(geographic_bounds)
+                inset_maps = collect_insets(reader, inset_geographies, header, workers)
+            plot_labels = visible_region_labels(named, geographic_masks, land, inset_maps, geographic_bounds)
+            label_sources = catalogue.sources
         warnings = []
         for code, entry in report.items():
             if entry.get("target_level_length_km") == 0:
@@ -801,6 +915,9 @@ def main(source: str, output: Path, cache: Path, bounds: tuple[float, float, flo
             "bounds_wgs84": bounds, "projection": "EPSG:3035 (Europe Lambert azimuthal equal-area)",
             "dimensions": [width, height], "administrative_divisions": report,
             "supplemental_sources": supplemental, "downloads": list(downloads.sources.values()),
+            "region_label_counts": dict(sorted(Counter(label.country for label in plot_labels).items())),
+            "region_label_sources": label_sources,
+            "labels": {"status": "pending" if labels else "disabled"},
             "warnings": warnings,
             "limitations": [
                 "Coverage checks detect absent levels, not missing individual divisions or outdated boundaries.",
@@ -820,12 +937,11 @@ def main(source: str, output: Path, cache: Path, bounds: tuple[float, float, flo
             click.echo(f"WARNING: {warning}", err=True)
         if warnings and not allow_missing:
             raise click.ClickException(f"Missing target-level data: see {manifest_path}. Supply --overlay ISO3=file.geojson, choose a newer archive, or explicitly use --allow-missing.")
-        # Preserve source geometry, including details visible when zooming the SVG.
-        # Zero tolerance removes only exactly collinear redundant vertices; no
-        # display-scale approximation is applied to make rendering faster.
-        tolerance = 0.0
-        render(land, coastline, union_all([admin, *extra]), countries, disputed, uk, masks, output,
-               width, height, labels, land_color, sea_color, admin_width, country_width, tolerance)
+        layout = render(land, coastline, union_all([admin, *extra]), countries, disputed, uk, masks, output,
+                        width, height, labels, land_color, sea_color, admin_width, country_width,
+                        plot_labels, inset_maps, region_fontsize, country_fontsize, editable_svg_text)
+        manifest["labels"] = {"status": "complete" if labels else "disabled", **layout}
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
         click.echo(f"Wrote {manifest_path}")
 
 

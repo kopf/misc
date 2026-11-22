@@ -23,6 +23,14 @@ import mapbox_vector_tile
 import mercantile
 import numpy as np
 from click.testing import CliRunner
+from geolabels import (
+    METROPOLITAN_COUNTIES,
+    ONS_URL,
+    PlotLabel,
+    RegionCatalogue,
+    place_labels,
+)
+from matplotlib.transforms import Bbox
 from PIL import Image
 from pmtiles.tile import Compression, TileType, zxy_to_tileid
 from pmtiles.writer import Writer
@@ -261,6 +269,86 @@ class MappingTests(unittest.TestCase):
             manifest = json.loads((root / "map.sources.json").read_text())
             self.assertEqual(manifest["warnings"], [])
             self.assertGreater(manifest["administrative_divisions"]["DEU"]["target_level_length_km"], 0)
+
+    def test_uk_labels_are_counties_not_metropolitan_or_london_boroughs(self):
+        features = []
+        index = 0
+        for members in METROPOLITAN_COUNTIES.values():
+            for name in members.split("|"):
+                features.append({"properties": {"CTYUA25CD": f"E080{index:05}", "CTYUA25NM": name},
+                                 "geometry": mapping(box(index, 0, index + 1, 1))})
+                index += 1
+        for i in range(1, 34):
+            features.append({"properties": {"CTYUA25CD": f"E090{i:05}",
+                                             "CTYUA25NM": "City of London" if i == 1 else f"Borough {i}"},
+                             "geometry": mapping(box(i, 3, i + 1, 4))})
+        features.append({"properties": {"CTYUA25CD": "E10000017", "CTYUA25NM": "Lancashire"},
+                         "geometry": mapping(box(0, 5, 10, 6))})
+
+        class FakeDownloads:
+            def json(self, url):
+                self_url = ONS_URL
+                if url != self_url:
+                    raise AssertionError(url)
+                return {"features": features}
+
+        def fake_gb(_downloads, code, level, count):
+            self.assertEqual((code, level, count), ("GBR", 1, 4))
+            return ([{"properties": {"shapeName": name}, "geometry": mapping(box(i, 10, i + 1, 11))}
+                     for i, name in enumerate(["England", "Scotland", "Wales", "Northern Ireland"])], {})
+
+        catalogue = RegionCatalogue(FakeDownloads(), "unused", fake_gb, "unused", {}, {})
+        irish = {name: box(i, 12, i + 1, 13) for i, name in enumerate(sorted(app.NI_COUNTIES))}
+        regions = catalogue.uk(irish, app.NI_COUNTIES)
+        names = {region.name for region in regions}
+        self.assertNotIn("Manchester", names)
+        self.assertNotIn("Liverpool", names)
+        self.assertNotIn("Borough 2", names)
+        self.assertIn("Greater Manchester", names)
+        self.assertIn("Merseyside", names)
+        self.assertIn("Greater London", names)
+        self.assertIn("City of London", names)
+        self.assertEqual(len(regions), 19)
+        self.assertEqual(sum(region.tier == "constituent" for region in regions), 4)
+
+    def test_italian_labels_use_twenty_regions_not_provinces(self):
+        catalogue = RegionCatalogue(None, "unused", None, "unused", {}, {})
+        catalogue.ne = [{"properties": {"adm0_a3": "ITA", "region": f"Region {i}", "name": f"Province {j}"},
+                         "geometry": mapping(box(2 * i + j, 0, 2 * i + j + 1, 1))}
+                        for i in range(20) for j in range(2)]
+        regions = catalogue.italy()
+        self.assertEqual(len(regions), 20)
+        self.assertTrue(all(region.name.startswith("Region") for region in regions))
+        self.assertTrue(all(region.geometry.area == 2 for region in regions))
+
+    def test_crowded_labels_have_no_overlap_and_none_are_dropped(self):
+        fig, ax = app.plt.subplots(figsize=(12, 8), dpi=100)
+        try:
+            ax.set_xlim(0, 100)
+            ax.set_ylim(0, 100)
+            ax.set_aspect("equal")
+            labels = [PlotLabel(f"region:{i}", "TEST", f"Region number {i}",
+                                box(50 + i / 1000, 50, 50.0005 + i / 1000, 50.0005))
+                      for i in range(24)]
+            info = place_labels(ax, labels, description="Test label layout")
+            self.assertEqual(len(info["placed"]), len(labels))
+            rectangles = [Bbox.from_extents(*entry["rectangle_pixels"]) for entry in info["placed"]]
+            for i, rectangle in enumerate(rectangles):
+                for other in rectangles[i + 1:]:
+                    self.assertFalse(rectangle.overlaps(other))
+            self.assertTrue(all(entry["leader"] for entry in info["placed"]))
+        finally:
+            app.plt.close(fig)
+
+    def test_impossible_label_layout_fails_instead_of_hiding_names(self):
+        fig, ax = app.plt.subplots(figsize=(4, 3), dpi=100)
+        try:
+            ax.set_xlim(0, 10)
+            ax.set_ylim(0, 10)
+            with self.assertRaisesRegex(app.click.ClickException, "Could not place 1 labels legibly"):
+                place_labels(ax, [PlotLabel("too-wide", "TEST", "X" * 400, box(0, 0, 10, 10))])
+        finally:
+            app.plt.close(fig)
 
     def test_invalid_country_and_bounds(self):
         for arguments in (["--countries", "GEO"], ["--bounds", "10", "50", "5", "55"]):
