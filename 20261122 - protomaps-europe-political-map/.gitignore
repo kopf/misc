@@ -1,0 +1,8 @@
+.cache/
+__pycache__/
+output/
+*.pmtiles
+*.png
+*.svg
+*.sources.json
+*.log
